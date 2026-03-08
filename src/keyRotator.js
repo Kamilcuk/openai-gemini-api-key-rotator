@@ -2,27 +2,43 @@ class KeyRotator {
   constructor(apiKeys, apiType = 'unknown') {
     this.apiKeys = [...apiKeys];
     this.apiType = apiType;
-    this.lastFailedKey = null; // Track the key that failed in the last request
+    this.keyFailureCounts = new Map();
+    this.apiKeys.forEach(key => this.keyFailureCounts.set(key, 0));
     console.log(`[${apiType.toUpperCase()}-ROTATOR] Initialized with ${this.apiKeys.length} API keys`);
   }
 
   /**
-   * Creates a new request context for per-request key rotation with smart shuffling
+   * Creates a new request context for per-request key rotation
    * @returns {RequestKeyContext} A new context for managing keys for a single request
    */
   createRequestContext() {
-    return new RequestKeyContext(this.apiKeys, this.apiType, this.lastFailedKey);
+    return new RequestKeyContext(this.apiKeys, this.apiType, this.keyFailureCounts);
   }
 
   /**
-   * Updates the last failed key from the completed request
-   * @param {string|null} failedKey The key that failed in the last request, or null if no key failed
+   * Increments the failure count for a given API key
+   * @param {string} apiKey The key that failed
    */
-  updateLastFailedKey(failedKey) {
-    this.lastFailedKey = failedKey;
-    if (failedKey) {
-      const maskedKey = this.maskApiKey(failedKey);
-      console.log(`[${this.apiType.toUpperCase()}-ROTATOR] Last failed key updated: ${maskedKey}`);
+  incrementFailureCount(apiKey) {
+    if (this.keyFailureCounts.has(apiKey)) {
+      const currentFailures = this.keyFailureCounts.get(apiKey);
+      this.keyFailureCounts.set(apiKey, currentFailures + 1);
+      const maskedKey = this.maskApiKey(apiKey);
+      console.log(`[${this.apiType.toUpperCase()}-ROTATOR] Failure count for ${maskedKey} incremented to ${currentFailures + 1}`);
+    }
+  }
+
+  /**
+   * Resets the failure count for a given API key to 0
+   * @param {string} apiKey The key that succeeded
+   */
+  resetFailureCount(apiKey) {
+    if (this.keyFailureCounts.has(apiKey)) {
+      if (this.keyFailureCounts.get(apiKey) > 0) {
+        this.keyFailureCounts.set(apiKey, 0);
+        const maskedKey = this.maskApiKey(apiKey);
+        console.log(`[${this.apiType.toUpperCase()}-ROTATOR] Failure count for ${maskedKey} reset to 0`);
+      }
     }
   }
 
@@ -41,50 +57,49 @@ class KeyRotator {
  * Each request gets its own context to try all available keys with smart shuffling
  */
 class RequestKeyContext {
-  constructor(apiKeys, apiType, lastFailedKey = null) {
+  constructor(apiKeys, apiType, keyFailureCounts) {
     this.originalApiKeys = [...apiKeys];
     this.apiType = apiType;
     this.currentIndex = 0;
     this.triedKeys = new Set();
     this.rateLimitedKeys = new Set();
-    this.lastFailedKeyForThisRequest = null;
     
-    // Apply smart shuffling: shuffle keys but move last failed key to end
-    this.apiKeys = this.smartShuffle(apiKeys, lastFailedKey);
-    
-    if (lastFailedKey) {
-      const maskedKey = this.maskApiKey(lastFailedKey);
-      console.log(`[${this.apiType.toUpperCase()}] Smart shuffle applied - last failed key ${maskedKey} moved to end`);
-    }
+    this.apiKeys = this.getPrioritizedKeys(keyFailureCounts);
+    console.log(`[${this.apiType.toUpperCase()}] Request context created with ${this.apiKeys.length} prioritized keys.`);
   }
   
   /**
-   * Smart shuffle: randomize key order but move last failed key to the end
-   * @param {Array} keys Array of API keys
-   * @param {string|null} lastFailedKey The key that failed in the previous request
-   * @returns {Array} Shuffled array with last failed key at the end
+   * Sorts keys by failure count (ascending) and shuffles keys within each failure group
+   * @param {Map<string, number>} keyFailureCounts Map of API key -> failure count
+   * @returns {Array<string>} A prioritized and partially shuffled array of API keys
    */
-  smartShuffle(keys, lastFailedKey) {
-    const shuffled = [...keys];
-    
-    // Fisher-Yates shuffle algorithm
-    for (let i = shuffled.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
-    }
-    
-    // If we have a last failed key, move it to the end
-    if (lastFailedKey && keys.includes(lastFailedKey)) {
-      const failedKeyIndex = shuffled.indexOf(lastFailedKey);
-      if (failedKeyIndex !== -1) {
-        // Remove the failed key from its current position
-        shuffled.splice(failedKeyIndex, 1);
-        // Add it to the end
-        shuffled.push(lastFailedKey);
+  getPrioritizedKeys(keyFailureCounts) {
+    // Group keys by their failure count
+    const groups = new Map();
+    for (const [key, count] of keyFailureCounts.entries()) {
+      if (!groups.has(count)) {
+        groups.set(count, []);
       }
+      groups.get(count).push(key);
     }
     
-    return shuffled;
+    // Get sorted failure counts (ascending)
+    const sortedCounts = [...groups.keys()].sort((a, b) => a - b);
+    
+    const prioritizedKeys = [];
+    for (const count of sortedCounts) {
+      const keysInGroup = groups.get(count);
+      
+      // Fisher-Yates shuffle for keys within the same failure group
+      for (let i = keysInGroup.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [keysInGroup[i], keysInGroup[j]] = [keysInGroup[j], keysInGroup[i]];
+      }
+      
+      prioritizedKeys.push(...keysInGroup);
+    }
+    
+    return prioritizedKeys;
   }
 
   /**
@@ -92,28 +107,17 @@ class RequestKeyContext {
    * @returns {string|null} The next API key to try, or null if all keys have been tried
    */
   getNextKey() {
-    // If we've tried all keys, return null
-    if (this.triedKeys.size >= this.apiKeys.length) {
+    if (this.currentIndex >= this.apiKeys.length) {
       return null;
     }
 
-    // Find the next untried key
-    let attempts = 0;
-    while (attempts < this.apiKeys.length) {
-      const key = this.apiKeys[this.currentIndex];
-      
-      if (!this.triedKeys.has(key)) {
-        this.triedKeys.add(key);
-        const maskedKey = this.maskApiKey(key);
-        console.log(`[${this.apiType.toUpperCase()}::${maskedKey}] Trying key (${this.triedKeys.size}/${this.apiKeys.length} tried for this request)`);
-        return key;
-      }
-      
-      this.currentIndex = (this.currentIndex + 1) % this.apiKeys.length;
-      attempts++;
-    }
+    const key = this.apiKeys[this.currentIndex];
+    this.triedKeys.add(key);
+    const maskedKey = this.maskApiKey(key);
+    console.log(`[${this.apiType.toUpperCase()}::${maskedKey}] Trying key (${this.triedKeys.size}/${this.apiKeys.length} tried for this request)`);
     
-    return null;
+    this.currentIndex++;
+    return key;
   }
 
   /**
@@ -122,20 +126,15 @@ class RequestKeyContext {
    */
   markKeyAsRateLimited(key) {
     this.rateLimitedKeys.add(key);
-    this.lastFailedKeyForThisRequest = key; // Track the most recent failed key
     const maskedKey = this.maskApiKey(key);
     console.log(`[${this.apiType.toUpperCase()}::${maskedKey}] Rate limited for this request (${this.rateLimitedKeys.size}/${this.triedKeys.size} rate limited)`);
-    
-    // Move to next key for the next attempt
-    this.currentIndex = (this.currentIndex + 1) % this.apiKeys.length;
   }
 
-  /**
-   * Gets the key that failed most recently in this request (for updating global state)
-   * @returns {string|null} The last key that was rate limited in this request
-   */
-  getLastFailedKey() {
-    return this.lastFailedKeyForThisRequest;
+  getWorkingKey() {
+    // The "working" key is the last one we tried from getNextKey that *didn't* fail.
+    // Since getNextKey increments currentIndex, the last-tried key is at currentIndex - 1.
+    const lastTriedIndex = this.currentIndex - 1;
+    return this.apiKeys[lastTriedIndex];
   }
 
   /**

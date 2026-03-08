@@ -52,18 +52,21 @@ class GeminiClient {
 
         // Check if this status code should trigger rotation
         if (rotationStatusCodes.has(response.statusCode)) {
-          console.log(`[GEMINI::${maskedKey}] Status ${response.statusCode} triggers rotation - trying next key`);
+          console.log(`[GEMINI::${maskedKey}] Status ${response.statusCode} triggers rotation - trying next key. Response: ${response.data}`);
           requestContext.markKeyAsRateLimited(apiKey);
+          this.keyRotator.incrementFailureCount(apiKey);
           lastResponse = response; // Keep the response in case all keys fail
           continue;
         }
 
         console.log(`[GEMINI::${maskedKey}] Success (${response.statusCode})`);
+        this.keyRotator.resetFailureCount(requestContext.getWorkingKey());
         return response;
       } catch (error) {
         console.log(`[GEMINI::${maskedKey}] Request failed: ${error.message}`);
         lastError = error;
         // For network errors, we still try the next key
+        this.keyRotator.incrementFailureCount(apiKey);
         continue;
       }
     }
@@ -71,10 +74,6 @@ class GeminiClient {
     // All keys have been tried for this request
     const stats = requestContext.getStats();
     console.log(`[GEMINI] All ${stats.totalKeys} keys tried for this request. ${stats.rateLimitedKeys} were rate limited.`);
-    
-    // Update the KeyRotator with the last failed key from this request
-    const lastFailedKey = requestContext.getLastFailedKey();
-    this.keyRotator.updateLastFailedKey(lastFailedKey);
     
     // If all tried keys were rate limited, return 429
     if (requestContext.allTriedKeysRateLimited()) {
