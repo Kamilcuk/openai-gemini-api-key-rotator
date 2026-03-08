@@ -12,4 +12,5 @@ COPY . .
 # Default port mentioned in README
 EXPOSE 8990
 
+USER nobody:nogroup
 CMD ["node", "index.js"]
