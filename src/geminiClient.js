@@ -8,27 +8,27 @@ class GeminiClient {
   }
 
   async makeRequest(method, path, body, headers = {}, customStatusCodes = null) {
-    // Check if an API key was provided in headers
-    const providedApiKey = headers['x-goog-api-key'];
-
-    // If an API key was provided, use it directly without rotation
-    if (providedApiKey) {
-      const maskedKey = this.maskApiKey(providedApiKey);
-      console.log(`[GEMINI::${maskedKey}] Using provided API key`);
-
-      // Remove the x-goog-api-key from headers since we'll handle it
-      const cleanHeaders = { ...headers };
-      delete cleanHeaders['x-goog-api-key'];
-
-      try {
-        const response = await this.sendRequest(method, path, body, cleanHeaders, providedApiKey, true);
-        console.log(`[GEMINI::${maskedKey}] Response (${response.statusCode})`);
-        return response;
-      } catch (error) {
-        console.log(`[GEMINI::${maskedKey}] Request failed: ${error.message}`);
-        throw error;
-      }
-    }
+    // // Check if an API key was provided in headers
+    // const providedApiKey = headers['x-goog-api-key'];
+    //
+    // // If an API key was provided, use it directly without rotation
+    // if (providedApiKey) {
+    //   const maskedKey = this.maskApiKey(providedApiKey);
+    //   console.log(`[GEMINI::${maskedKey}] Using provided API key`);
+    //
+    //   // Remove the x-goog-api-key from headers since we'll handle it
+    //   const cleanHeaders = { ...headers };
+    //   delete cleanHeaders['x-goog-api-key'];
+    //
+    //   try {
+    //     const response = await this.sendRequest(method, path, body, cleanHeaders, providedApiKey, true);
+    //     console.log(`[GEMINI::${maskedKey}] Response (${response.statusCode})`);
+    //     return response;
+    //   } catch (error) {
+    //     console.log(`[GEMINI::${maskedKey}] Request failed: ${error.message}`);
+    //     throw error;
+    //   }
+    // }
 
     // No API key provided, use rotation system
     // Create a new request context for this specific request
