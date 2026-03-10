@@ -99,7 +99,16 @@ class RequestKeyContext {
       prioritizedKeys.push(...keysInGroup);
     }
     
+    // Log the prioritized order for debugging
+    const maskedOrder = prioritizedKeys.map(key => this.maskApiKey(key));
+    console.log(`[${this.apiType.toUpperCase()}-ROTATOR] Prioritized key order: [${maskedOrder.join(', ')}]`);
+    
     return prioritizedKeys;
+  }
+
+  maskApiKey(key) {
+    if (!key || key.length < 8) return '***';
+    return key.substring(0, 4) + '...' + key.substring(key.length - 4);
   }
 
   /**
