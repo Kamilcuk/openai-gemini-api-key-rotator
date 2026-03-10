@@ -47,8 +47,8 @@ class KeyRotator {
   }
 
   maskApiKey(key) {
-    if (!key || key.length < 8) return '***';
-    return key.substring(0, 4) + '...' + key.substring(key.length - 4);
+    if (!key || key.length < 4) return '**';
+    return '**' + key.substring(key.length - 4);
   }
 }
 
@@ -63,6 +63,7 @@ class RequestKeyContext {
     this.currentIndex = 0;
     this.triedKeys = new Set();
     this.rateLimitedKeys = new Set();
+    this.keyStatuses = new Map();
     
     this.apiKeys = this.getPrioritizedKeys(keyFailureCounts);
     console.log(`[${this.apiType.toUpperCase()}] Request context created with ${this.apiKeys.length} prioritized keys.`);
@@ -107,8 +108,8 @@ class RequestKeyContext {
   }
 
   maskApiKey(key) {
-    if (!key || key.length < 8) return '***';
-    return key.substring(0, 4) + '...' + key.substring(key.length - 4);
+    if (!key || key.length < 4) return '**';
+    return '**' + key.substring(key.length - 4);
   }
 
   /**
@@ -137,6 +138,15 @@ class RequestKeyContext {
     this.rateLimitedKeys.add(key);
     const maskedKey = this.maskApiKey(key);
     console.log(`[${this.apiType.toUpperCase()}::${maskedKey}] Rate limited for this request (${this.rateLimitedKeys.size}/${this.triedKeys.size} rate limited)`);
+  }
+
+  /**
+   * Records the status code for a given key
+   * @param {string} key The API key
+   * @param {number|string} status The HTTP status code or error message
+   */
+  recordKeyStatus(key, status) {
+    this.keyStatuses.set(key, status);
   }
 
   getWorkingKey() {
@@ -171,13 +181,14 @@ class RequestKeyContext {
       totalKeys: this.apiKeys.length,
       triedKeys: this.triedKeys.size,
       rateLimitedKeys: this.rateLimitedKeys.size,
-      hasUntriedKeys: this.triedKeys.size < this.apiKeys.length
+      hasUntriedKeys: this.triedKeys.size < this.apiKeys.length,
+      keyStatuses: this.keyStatuses
     };
   }
 
   maskApiKey(key) {
-    if (!key || key.length < 8) return '***';
-    return key.substring(0, 4) + '...' + key.substring(key.length - 4);
+    if (!key || key.length < 4) return '**';
+    return '**' + key.substring(key.length - 4);
   }
 }
 

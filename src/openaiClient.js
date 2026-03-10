@@ -18,8 +18,15 @@ class OpenAIClient {
     const rotationStatusCodes = customStatusCodes || new Set([429]);
 
     // Try each available key for this request
+    let isFirstAttempt = true;
     let apiKey;
     while ((apiKey = requestContext.getNextKey()) !== null) {
+      if (!isFirstAttempt) {
+        console.log('[OPENAI] Waiting 1 second before trying next key...');
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+      isFirstAttempt = false;
+
       const maskedKey = this.maskApiKey(apiKey);
 
       console.log(`[OPENAI::${maskedKey}] Attempting ${method} ${path}`);
@@ -147,8 +154,8 @@ class OpenAIClient {
   }
 
   maskApiKey(key) {
-    if (!key || key.length < 8) return '***';
-    return key.substring(0, 4) + '...' + key.substring(key.length - 4);
+    if (!key || key.length < 4) return '**';
+    return '**' + key.substring(key.length - 4);
   }
 }
 

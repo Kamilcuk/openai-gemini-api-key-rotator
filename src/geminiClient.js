@@ -8,96 +8,108 @@ class GeminiClient {
   }
 
   async makeRequest(method, path, body, headers = {}, customStatusCodes = null) {
-    // // Check if an API key was provided in headers
-    // const providedApiKey = headers['x-goog-api-key'];
-    //
-    // // If an API key was provided, use it directly without rotation
-    // if (providedApiKey) {
-    //   const maskedKey = this.maskApiKey(providedApiKey);
-    //   console.log(`[GEMINI::${maskedKey}] Using provided API key`);
-    //
-    //   // Remove the x-goog-api-key from headers since we'll handle it
-    //   const cleanHeaders = { ...headers };
-    //   delete cleanHeaders['x-goog-api-key'];
-    //
-    //   try {
-    //     const response = await this.sendRequest(method, path, body, cleanHeaders, providedApiKey, true);
-    //     console.log(`[GEMINI::${maskedKey}] Response (${response.statusCode})`);
-    //     return response;
-    //   } catch (error) {
-    //     console.log(`[GEMINI::${maskedKey}] Request failed: ${error.message}`);
-    //     throw error;
-    //   }
-    // }
+    let pathsToTry = [path];
+    
+    if (path && path.includes('/models/mypro:')) {
+      pathsToTry = [
+        path.replace(/\/models\/mypro:/, '/models/gemini-3.1-pro-preview:'),
+        path.replace(/\/models\/mypro:/, '/models/gemini-3-pro-preview:'),
+        path.replace(/\/models\/mypro:/, '/models/gemini-2.5-pro:')
+      ];
+      console.log(`[GEMINI] "pro" model requested. Will try fallback strategy: ${pathsToTry.join(' then ')}`);
+    }
 
-    // No API key provided, use rotation system
-    // Create a new request context for this specific request
-    const requestContext = this.keyRotator.createRequestContext();
+    const rotationStatusCodes = customStatusCodes || new Set([429]);
     let lastError = null;
     let lastResponse = null;
 
-    // Determine which status codes should trigger rotation
-    // Default is just 429, but can be overridden
-    const rotationStatusCodes = customStatusCodes || new Set([429]);
+    let isFirstAttempt = true;
+    for (let pathIndex = 0; pathIndex < pathsToTry.length; pathIndex++) {
+      const currentPath = pathsToTry[pathIndex];
+      const requestContext = this.keyRotator.createRequestContext();
+      let apiKey;
+      
+      while ((apiKey = requestContext.getNextKey()) !== null) {
+        if (!isFirstAttempt) {
+          console.log('[GEMINI] Waiting 1 second before trying next key...');
+          await new Promise(resolve => setTimeout(resolve, 2000));
+        }
+        isFirstAttempt = false;
 
-    // Try each available key for this request
-    let apiKey;
-    while ((apiKey = requestContext.getNextKey()) !== null) {
-      const maskedKey = this.maskApiKey(apiKey);
+        const maskedKey = this.maskApiKey(apiKey);
 
-      console.log(`[GEMINI::${maskedKey}] Attempting ${method} ${path}`);
+        console.log(`[GEMINI::${maskedKey}] Attempting ${method} ${currentPath}`);
 
-      try {
-        const response = await this.sendRequest(method, path, body, headers, apiKey, false);
+        try {
+          let response = await this.sendRequest(method, currentPath, body, headers, apiKey, false);
+          
+          if (response.statusCode === 503 && response.data && response.data.includes('high demand')) {
+            console.log(`[GEMINI::${maskedKey}] Model overloaded (503). Waiting 10 seconds before retrying...`);
+            await new Promise(resolve => setTimeout(resolve, 20000));
+            console.log(`[GEMINI::${maskedKey}] Retrying ${method} ${currentPath} after delay...`);
+            response = await this.sendRequest(method, currentPath, body, headers, apiKey, false);
+          }
+          
+          requestContext.recordKeyStatus(apiKey, response.statusCode);
 
-        // Check if this status code should trigger rotation
-        if (rotationStatusCodes.has(response.statusCode)) {
-          console.log(`[GEMINI::${maskedKey}] Status ${response.statusCode} triggers rotation - trying next key. Response: ${response.data}`);
-          requestContext.markKeyAsRateLimited(apiKey);
+          if (rotationStatusCodes.has(response.statusCode)) {
+            console.log(`[GEMINI::${maskedKey}] Status ${response.statusCode} triggers rotation - trying next key. Response: ${response.data}`);
+            requestContext.markKeyAsRateLimited(apiKey);
+            this.keyRotator.incrementFailureCount(apiKey);
+            lastResponse = response;
+            continue;
+          }
+
+          console.log(`[GEMINI::${maskedKey}] Success (${response.statusCode})`);
+          this.keyRotator.resetFailureCount(requestContext.getWorkingKey());
+          return response;
+        } catch (error) {
+          console.log(`[GEMINI::${maskedKey}] Request failed: ${error.message}`);
+          lastError = error;
+          requestContext.recordKeyStatus(apiKey, error.message);
           this.keyRotator.incrementFailureCount(apiKey);
-          lastResponse = response; // Keep the response in case all keys fail
           continue;
         }
-
-        console.log(`[GEMINI::${maskedKey}] Success (${response.statusCode})`);
-        this.keyRotator.resetFailureCount(requestContext.getWorkingKey());
-        return response;
-      } catch (error) {
-        console.log(`[GEMINI::${maskedKey}] Request failed: ${error.message}`);
-        lastError = error;
-        // For network errors, we still try the next key
-        this.keyRotator.incrementFailureCount(apiKey);
-        continue;
+      }
+      
+      const stats = requestContext.getStats();
+      let statusLog = [];
+      if (stats.keyStatuses) {
+        for (const [key, status] of stats.keyStatuses.entries()) {
+          statusLog.push(`${this.maskApiKey(key)}=${status}`);
+        }
+      }
+      const statusString = statusLog.length > 0 ? ` Statuses: [${statusLog.join(', ')}]` : '';
+      console.log(`[GEMINI] All ${stats.totalKeys} keys tried for ${currentPath}. ${stats.rateLimitedKeys} were rate limited.${statusString}`);
+      
+      if (requestContext.allTriedKeysRateLimited()) {
+        if (pathIndex < pathsToTry.length - 1) {
+          console.log(`[GEMINI] All keys rate limited for ${currentPath}, falling back to next model in sequence...`);
+          continue;
+        } else {
+          console.log('[GEMINI] All keys rate limited for all models - returning 429');
+          return lastResponse || {
+            statusCode: 429,
+            headers: { 'content-type': 'application/json' },
+            data: JSON.stringify({
+              error: {
+                code: 429,
+                message: 'All API keys have been rate limited for this request',
+                status: 'RESOURCE_EXHAUSTED'
+              }
+            })
+          };
+        }
+      }
+      
+      if (lastError && pathIndex === pathsToTry.length - 1) {
+        throw lastError;
+      }
+      
+      if (pathIndex === pathsToTry.length - 1) {
+        throw new Error('All API keys exhausted without clear error');
       }
     }
-    
-    // All keys have been tried for this request
-    const stats = requestContext.getStats();
-    console.log(`[GEMINI] All ${stats.totalKeys} keys tried for this request. ${stats.rateLimitedKeys} were rate limited.`);
-    
-    // If all tried keys were rate limited, return 429
-    if (requestContext.allTriedKeysRateLimited()) {
-      console.log('[GEMINI] All keys rate limited for this request - returning 429');
-      return lastResponse || {
-        statusCode: 429,
-        headers: { 'content-type': 'application/json' },
-        data: JSON.stringify({
-          error: {
-            code: 429,
-            message: 'All API keys have been rate limited for this request',
-            status: 'RESOURCE_EXHAUSTED'
-          }
-        })
-      };
-    }
-    
-    // If we had other types of errors, throw the last one
-    if (lastError) {
-      throw lastError;
-    }
-    
-    // Fallback error
-    throw new Error('All API keys exhausted without clear error');
   }
 
   sendRequest(method, path, body, headers, apiKey, useHeader = false) {
@@ -194,8 +206,8 @@ class GeminiClient {
   }
 
   maskApiKey(key) {
-    if (!key || key.length < 8) return '***';
-    return key.substring(0, 4) + '...' + key.substring(key.length - 4);
+    if (!key || key.length < 4) return '**';
+    return '**' + key.substring(key.length - 4);
   }
 }
 
