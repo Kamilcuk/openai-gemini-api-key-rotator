@@ -48,7 +48,7 @@ class GeminiClient {
 
           const stats = this.keyRotator.constructor.getUsageStats(apiKey, model);
           const countStr = Object.entries(stats.requests).map(([status, count]) => `${status}:${count}`).join(', ') || 'None';
-          const tokenStr = stats.tokens.total > 0 ? ` | Tokens: In=${stats.tokens.in}, Out=${stats.tokens.out}, Total=${stats.tokens.total}` : '';
+          const tokenStr = ` | Tokens: In=${stats.tokens.in}, Out=${stats.tokens.out}, Total=${stats.tokens.total}`;
           const maskedKey = this.maskApiKey(apiKey);
           logger.info(`[GEMINI::${maskedKey}] Attempting ${method} ${model} (ReqPerHttpCode: ${countStr}${tokenStr})`);
 
