@@ -3,3 +3,5 @@
 /.claude
 *.log
 /.serena
+state.json
+plan.md

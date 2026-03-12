@@ -1,10 +1,12 @@
 const https = require('https');
 const { URL } = require('url');
+const logger = require('./logger');
 
 class OpenAIClient {
-  constructor(keyRotator, baseUrl = 'https://api.openai.com') {
+  constructor(keyRotator, baseUrl = 'https://api.openai.com', proxyAgent = null) {
     this.keyRotator = keyRotator;
     this.baseUrl = baseUrl;
+    this.proxyAgent = proxyAgent;
   }
 
   async makeRequest(method, path, body, headers = {}, customStatusCodes = null) {
@@ -22,32 +24,32 @@ class OpenAIClient {
     let apiKey;
     while ((apiKey = requestContext.getNextKey()) !== null) {
       if (!isFirstAttempt) {
-        console.log('[OPENAI] Waiting 1 second before trying next key...');
+        logger.info('[OPENAI] Waiting 1 second before trying next key...');
         await new Promise(resolve => setTimeout(resolve, 1000));
       }
       isFirstAttempt = false;
 
       const maskedKey = this.maskApiKey(apiKey);
 
-      console.log(`[OPENAI::${maskedKey}] Attempting ${method} ${path}`);
+      logger.info(`[OPENAI::${maskedKey}] Attempting ${method} ${path}`);
 
       try {
         const response = await this.sendRequest(method, path, body, headers, apiKey);
 
         // Check if this status code should trigger rotation
         if (rotationStatusCodes.has(response.statusCode)) {
-          console.log(`[OPENAI::${maskedKey}] Status ${response.statusCode} triggers rotation - trying next key. Response: ${response.data}`);
+          logger.info(`[OPENAI::${maskedKey}] Status ${response.statusCode} triggers rotation - trying next key. Response: ${response.data}`);
           requestContext.markKeyAsRateLimited(apiKey);
           this.keyRotator.incrementFailureCount(apiKey);
           lastResponse = response; // Keep the response in case all keys fail
           continue;
         }
 
-        console.log(`[OPENAI::${maskedKey}] Success (${response.statusCode})`);
+        logger.info(`[OPENAI::${maskedKey}] Success (${response.statusCode})`);
         this.keyRotator.resetFailureCount(requestContext.getWorkingKey());
         return response;
       } catch (error) {
-        console.log(`[OPENAI::${maskedKey}] Request failed: ${error.message}`);
+        logger.info(`[OPENAI::${maskedKey}] Request failed: ${error.message}`);
         lastError = error;
         // For network errors, we still try the next key
         this.keyRotator.incrementFailureCount(apiKey);
@@ -57,11 +59,11 @@ class OpenAIClient {
     
     // All keys have been tried for this request
     const stats = requestContext.getStats();
-    console.log(`[OPENAI] All ${stats.totalKeys} keys tried for this request. ${stats.rateLimitedKeys} were rate limited.`);
+    logger.info(`[OPENAI] All ${stats.totalKeys} keys tried for this request. ${stats.rateLimitedKeys} were rate limited.`);
     
     // If all tried keys were rate limited, return 429
     if (requestContext.allTriedKeysRateLimited()) {
-      console.log('[OPENAI] All keys rate limited for this request - returning 429');
+      logger.info('[OPENAI] All keys rate limited for this request - returning 429');
       return lastResponse || {
         statusCode: 429,
         headers: { 'content-type': 'application/json' },
@@ -114,7 +116,8 @@ class OpenAIClient {
         port: url.port || 443,
         path: url.pathname + url.search,
         method: method,
-        headers: finalHeaders
+        headers: finalHeaders,
+        agent: this.proxyAgent
       };
 
       if (body && method !== 'GET') {
@@ -140,7 +143,7 @@ class OpenAIClient {
 
       req.on('error', (error) => {
         const maskedKey = this.maskApiKey(apiKey);
-        console.log(`[OPENAI::${maskedKey}] HTTP request error: ${error.message}`);
+        logger.error(`[OPENAI::${maskedKey}] HTTP request error: ${error.message}`);
         reject(error);
       });
 

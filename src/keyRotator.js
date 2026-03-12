@@ -1,18 +1,202 @@
+const logger = require('./logger');
+const fs = require('fs');
+const path = require('path');
+
+// Global state for rate limits shared across all instances
+const globalCooldowns = new Map();
+const globalUsageStats = new Map(); // Stores { requests: { [status]: number }, tokens: { in: number, out: number, total: number } }
+const COOLDOWN_DURATION = 60 * 60 * 1000; // 60 minutes
+const STATE_FILE = path.join(process.cwd(), 'state.json');
+
+// Load state from file on startup
+function loadState() {
+  try {
+    if (fs.existsSync(STATE_FILE)) {
+      const data = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+      if (data.globalCooldowns) {
+        for (const [key, timestamp] of Object.entries(data.globalCooldowns)) {
+          // Only load if not expired
+          if (Date.now() - timestamp < COOLDOWN_DURATION) {
+            globalCooldowns.set(key, timestamp);
+          }
+        }
+        logger.info(`[STATE] Loaded ${globalCooldowns.size} active rate limits from state.json`);
+      }
+      
+      // Load and migrate stats
+      if (data.globalUsageStats) {
+        for (const [key, stats] of Object.entries(data.globalUsageStats)) {
+          globalUsageStats.set(key, stats);
+        }
+        logger.info(`[STATE] Loaded usage stats for ${globalUsageStats.size} key/model pairs from state.json`);
+      } else {
+        // Migration path from previous split format
+        let migratedCount = 0;
+        if (data.globalRequestCounts) {
+          for (const [key, counts] of Object.entries(data.globalRequestCounts)) {
+            const stats = globalUsageStats.get(key) || { requests: {}, tokens: { in: 0, out: 0, total: 0 } };
+            
+            // Handle migration from older formats (good/bad, plain numbers, or status dicts)
+            if (typeof counts === 'number') {
+               stats.requests["200"] = counts;
+            } else if (counts.good !== undefined || counts.bad !== undefined) {
+               stats.requests["200"] = counts.good || 0;
+               stats.requests["error"] = counts.bad || 0;
+            } else {
+               stats.requests = counts;
+            }
+            globalUsageStats.set(key, stats);
+            migratedCount++;
+          }
+        }
+        if (data.globalTokenCounts) {
+          for (const [key, counts] of Object.entries(data.globalTokenCounts)) {
+            const stats = globalUsageStats.get(key) || { requests: {}, tokens: { in: 0, out: 0, total: 0 } };
+            stats.tokens = counts;
+            globalUsageStats.set(key, stats);
+            migratedCount++;
+          }
+        }
+        if (migratedCount > 0) {
+          logger.info(`[STATE] Migrated usage stats for ${globalUsageStats.size} key/model pairs from older format.`);
+        }
+      }
+
+      // Print loaded counts
+      for (const [key, stats] of globalUsageStats.entries()) {
+        const [apiKey, model] = key.split(':');
+        const maskedKey = apiKey ? ('**' + apiKey.substring(Math.max(0, apiKey.length - 4))) : '**';
+        const countStr = Object.entries(stats.requests).map(([status, count]) => `${status}:${count}`).join(', ') || 'None';
+        const tokenStr = ` | Tokens: In=${stats.tokens.in}, Out=${stats.tokens.out}, Total=${stats.tokens.total}`;
+        logger.info(`[STATE] ${maskedKey} : ${model} -> ReqPerHttpCode: ${countStr}${tokenStr}`);
+      }
+    }
+  } catch (error) {
+    logger.info(`[STATE] Failed to load state.json: ${error.message}`);
+  }
+}
+
+// Save state to file
+function saveState() {
+  try {
+    const activeCooldowns = {};
+    for (const [key, timestamp] of globalCooldowns.entries()) {
+      if (Date.now() - timestamp < COOLDOWN_DURATION) {
+        activeCooldowns[key] = timestamp;
+      }
+    }
+    const usageStats = {};
+    for (const [key, stats] of globalUsageStats.entries()) {
+      usageStats[key] = stats;
+    }
+    fs.writeFileSync(STATE_FILE, JSON.stringify({ globalCooldowns: activeCooldowns, globalUsageStats: usageStats }, null, 2));
+  } catch (error) {
+    logger.info(`[STATE] Failed to save state.json: ${error.message}`);
+  }
+}
+
+loadState();
+
 class KeyRotator {
   constructor(apiKeys, apiType = 'unknown') {
     this.apiKeys = [...apiKeys];
     this.apiType = apiType;
     this.keyFailureCounts = new Map();
     this.apiKeys.forEach(key => this.keyFailureCounts.set(key, 0));
-    console.log(`[${apiType.toUpperCase()}-ROTATOR] Initialized with ${this.apiKeys.length} API keys`);
+    logger.info(`[${apiType.toUpperCase()}-ROTATOR] Initialized with ${this.apiKeys.length} API keys`);
+  }
+
+  /**
+   * Gets the unified usage statistics for a given key and model combination
+   */
+  static getUsageStats(apiKey, modelName) {
+    const compositeKey = `${apiKey}:${modelName}`;
+    return globalUsageStats.get(compositeKey) || { requests: {}, tokens: { in: 0, out: 0, total: 0 } };
+  }
+
+  /**
+   * Records the HTTP status or error for a given key and model combination
+   */
+  static recordRequestStatus(apiKey, modelName, status) {
+    const compositeKey = `${apiKey}:${modelName}`;
+    const current = KeyRotator.getUsageStats(apiKey, modelName);
+    const statusKey = String(status);
+    current.requests[statusKey] = (current.requests[statusKey] || 0) + 1;
+    globalUsageStats.set(compositeKey, current);
+    saveState();
+    return current;
+  }
+
+  /**
+   * Records the token usage for a given key and model combination
+   */
+  static recordTokens(apiKey, modelName, inTokens, outTokens, totalTokens) {
+    const compositeKey = `${apiKey}:${modelName}`;
+    const current = KeyRotator.getUsageStats(apiKey, modelName);
+    current.tokens.in += (inTokens || 0);
+    current.tokens.out += (outTokens || 0);
+    current.tokens.total += (totalTokens || 0);
+    globalUsageStats.set(compositeKey, current);
+    saveState();
+    return current;
+  }
+
+  /**
+   * Marks a key and model combination as rate limited
+   * @param {string} apiKey The API key
+   * @param {string} modelName The model name
+   */
+  static markRateLimited(apiKey, modelName) {
+    const compositeKey = `${apiKey}:${modelName}`;
+    globalCooldowns.set(compositeKey, Date.now());
+    saveState();
+    const maskedKey = KeyRotator.maskKeyStatic(apiKey);
+    logger.info(`[RATELIMIT] Key ${maskedKey} for model ${modelName} marked as rate limited for 60 minutes`);
+  }
+
+  /**
+   * Checks if a key and model combination is available
+   * @param {string} apiKey The API key
+   * @param {string} modelName The model name
+   * @returns {boolean} True if available, false if in cooldown
+   */
+  static isAvailable(apiKey, modelName) {
+    const compositeKey = `${apiKey}:${modelName}`;
+    if (!globalCooldowns.has(compositeKey)) return true;
+
+    const timestamp = globalCooldowns.get(compositeKey);
+    const now = Date.now();
+    
+    if (now - timestamp > COOLDOWN_DURATION) {
+      globalCooldowns.delete(compositeKey);
+      saveState();
+      return true;
+    }
+    
+    return false;
+  }
+
+  /**
+   * Gets the remaining cooldown time for a key/model combo in ms
+   */
+  static getRemainingCooldown(apiKey, modelName) {
+    const compositeKey = `${apiKey}:${modelName}`;
+    if (!globalCooldowns.has(compositeKey)) return 0;
+    const timestamp = globalCooldowns.get(compositeKey);
+    return Math.max(0, COOLDOWN_DURATION - (Date.now() - timestamp));
+  }
+
+  static maskKeyStatic(key) {
+    if (!key || key.length < 4) return '**';
+    return '**' + key.substring(key.length - 4);
   }
 
   /**
    * Creates a new request context for per-request key rotation
    * @returns {RequestKeyContext} A new context for managing keys for a single request
    */
-  createRequestContext() {
-    return new RequestKeyContext(this.apiKeys, this.apiType, this.keyFailureCounts);
+  createRequestContext(modelName = null) {
+    return new RequestKeyContext(this.apiKeys, this.apiType, this.keyFailureCounts, modelName);
   }
 
   /**
@@ -24,7 +208,7 @@ class KeyRotator {
       const currentFailures = this.keyFailureCounts.get(apiKey);
       this.keyFailureCounts.set(apiKey, currentFailures + 1);
       const maskedKey = this.maskApiKey(apiKey);
-      console.log(`[${this.apiType.toUpperCase()}-ROTATOR] Failure count for ${maskedKey} incremented to ${currentFailures + 1}`);
+      logger.info(`[${this.apiType.toUpperCase()}-ROTATOR] Failure count for ${maskedKey} incremented to ${currentFailures + 1}`);
     }
   }
 
@@ -37,7 +221,7 @@ class KeyRotator {
       if (this.keyFailureCounts.get(apiKey) > 0) {
         this.keyFailureCounts.set(apiKey, 0);
         const maskedKey = this.maskApiKey(apiKey);
-        console.log(`[${this.apiType.toUpperCase()}-ROTATOR] Failure count for ${maskedKey} reset to 0`);
+        logger.info(`[${this.apiType.toUpperCase()}-ROTATOR] Failure count for ${maskedKey} reset to 0`);
       }
     }
   }
@@ -57,16 +241,17 @@ class KeyRotator {
  * Each request gets its own context to try all available keys with smart shuffling
  */
 class RequestKeyContext {
-  constructor(apiKeys, apiType, keyFailureCounts) {
+  constructor(apiKeys, apiType, keyFailureCounts, modelName = null) {
     this.originalApiKeys = [...apiKeys];
     this.apiType = apiType;
     this.currentIndex = 0;
     this.triedKeys = new Set();
     this.rateLimitedKeys = new Set();
     this.keyStatuses = new Map();
+    this.modelName = modelName;
     
     this.apiKeys = this.getPrioritizedKeys(keyFailureCounts);
-    console.log(`[${this.apiType.toUpperCase()}] Request context created with ${this.apiKeys.length} prioritized keys.`);
+    logger.info(`[${this.apiType.toUpperCase()}] Request context created with ${this.apiKeys.length} prioritized keys.`);
   }
   
   /**
@@ -102,7 +287,7 @@ class RequestKeyContext {
     
     // Log the prioritized order for debugging
     const maskedOrder = prioritizedKeys.map(key => this.maskApiKey(key));
-    console.log(`[${this.apiType.toUpperCase()}-ROTATOR] Prioritized key order: [${maskedOrder.join(', ')}]`);
+    logger.info(`[${this.apiType.toUpperCase()}-ROTATOR] Prioritized key order: [${maskedOrder.join(', ')}]`);
     
     return prioritizedKeys;
   }
@@ -117,17 +302,27 @@ class RequestKeyContext {
    * @returns {string|null} The next API key to try, or null if all keys have been tried
    */
   getNextKey() {
-    if (this.currentIndex >= this.apiKeys.length) {
-      return null;
+    while (this.currentIndex < this.apiKeys.length) {
+      const key = this.apiKeys[this.currentIndex];
+      this.currentIndex++;
+
+      // Check global cooldown if modelName is provided
+      if (this.modelName && !KeyRotator.isAvailable(key, this.modelName)) {
+        const maskedKey = this.maskApiKey(key);
+        const remainingMs = KeyRotator.getRemainingCooldown(key, this.modelName);
+        const remainingSec = Math.ceil(remainingMs / 1000);
+        logger.info(`[${this.apiType.toUpperCase()}::${maskedKey}] Skipping key - in global cooldown for ${this.modelName} (${remainingSec}s remaining)`);
+        continue;
+      }
+
+      this.triedKeys.add(key);
+      const maskedKey = this.maskApiKey(key);
+      logger.info(`[${this.apiType.toUpperCase()}::${maskedKey}] Trying key (${this.triedKeys.size}/${this.apiKeys.length} available)`);
+      
+      return key;
     }
 
-    const key = this.apiKeys[this.currentIndex];
-    this.triedKeys.add(key);
-    const maskedKey = this.maskApiKey(key);
-    console.log(`[${this.apiType.toUpperCase()}::${maskedKey}] Trying key (${this.triedKeys.size}/${this.apiKeys.length} tried for this request)`);
-    
-    this.currentIndex++;
-    return key;
+    return null;
   }
 
   /**
@@ -137,7 +332,7 @@ class RequestKeyContext {
   markKeyAsRateLimited(key) {
     this.rateLimitedKeys.add(key);
     const maskedKey = this.maskApiKey(key);
-    console.log(`[${this.apiType.toUpperCase()}::${maskedKey}] Rate limited for this request (${this.rateLimitedKeys.size}/${this.triedKeys.size} rate limited)`);
+    logger.info(`[${this.apiType.toUpperCase()}::${maskedKey}] Rate limited for this request (${this.rateLimitedKeys.size}/${this.triedKeys.size} rate limited)`);
   }
 
   /**

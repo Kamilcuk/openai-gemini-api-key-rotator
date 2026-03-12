@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const logger = require('./logger');
 
 class Config {
   constructor() {
@@ -14,12 +15,12 @@ class Config {
   loadConfig() {
     const envPath = path.join(process.cwd(), '.env');
 
-    console.log(`[CONFIG] Loading configuration from ${envPath}`);
+    logger.info(`[CONFIG] Loading configuration from ${envPath}`);
 
     if (!fs.existsSync(envPath)) {
-      console.error('\n❌ ERROR: .env file not found!');
-      console.error('Please create a .env file with the required configuration.');
-      console.error('You can copy .env.example to .env and update the values.\n');
+      logger.error('\n❌ ERROR: .env file not found!');
+      logger.error('Please create a .env file with the required configuration.');
+      logger.error('You can copy .env.example to .env and update the values.\n');
       throw new Error('.env file not found');
     }
 
@@ -38,12 +39,12 @@ class Config {
     }
 
     if (missingFields.length > 0) {
-      console.error('\n❌ ERROR: Required fields missing in .env file!');
-      console.error(`Missing fields: ${missingFields.join(', ')}`);
-      console.error('\nBoth PORT and ADMIN_PASSWORD are required to run the server.');
-      console.error('Example configuration:');
-      console.error('  PORT=8990');
-      console.error('  ADMIN_PASSWORD=your-secure-password\n');
+      logger.error('\n❌ ERROR: Required fields missing in .env file!');
+      logger.error(`Missing fields: ${missingFields.join(', ')}`);
+      logger.error('\nBoth PORT and ADMIN_PASSWORD are required to run the server.');
+      logger.error('Example configuration:');
+      logger.error('  PORT=8990');
+      logger.error('  ADMIN_PASSWORD=your-secure-password\n');
       throw new Error(`Required fields missing: ${missingFields.join(', ')}`);
     }
 
@@ -51,8 +52,8 @@ class Config {
     this.port = parseInt(envVars.PORT);
     this.adminPassword = envVars.ADMIN_PASSWORD;
 
-    console.log(`[CONFIG] Port: ${this.port}`);
-    console.log(`[CONFIG] Admin panel enabled with password authentication`);
+    logger.info(`[CONFIG] Port: ${this.port}`);
+    logger.info(`[CONFIG] Admin panel enabled with password authentication`);
 
     // Clear existing providers
     this.providers.clear();
@@ -61,16 +62,16 @@ class Config {
     this.parseProviders(envVars);
     this.parseBackwardCompatibility(envVars);
 
-    console.log(`[CONFIG] Found ${this.providers.size} providers configured`);
+    logger.info(`[CONFIG] Found ${this.providers.size} providers configured`);
 
     // Log each provider
     for (const [providerName, config] of this.providers.entries()) {
       const maskedKeys = config.keys.map(key => this.maskApiKey(key));
-      console.log(`[CONFIG] Provider '${providerName}' (${config.apiType}): ${config.keys.length} keys [${maskedKeys.join(', ')}] → ${config.baseUrl}`);
+      logger.info(`[CONFIG] Provider '${providerName}' (${config.apiType}): ${config.keys.length} keys [${maskedKeys.join(', ')}] → ${config.baseUrl}`);
     }
 
     if (this.providers.size === 0) {
-      console.log(`[CONFIG] No providers configured yet - use the admin panel at http://localhost:${this.port}/admin to add providers`);
+      logger.info(`[CONFIG] No providers configured yet - use the admin panel at http://localhost:${this.port}/admin to add providers`);
     }
   }
 

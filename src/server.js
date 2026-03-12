@@ -3,12 +3,14 @@ const { URL } = require('url');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const logger = require('./logger');
 
 class ProxyServer {
-  constructor(config, geminiClient = null, openaiClient = null) {
+  constructor(config, geminiClient = null, openaiClient = null, proxyAgent = null) {
     this.config = config;
     this.geminiClient = geminiClient;
     this.openaiClient = openaiClient;
+    this.proxyAgent = proxyAgent;
     this.providerClients = new Map(); // Map of provider_name -> client instance
     this.server = null;
     this.adminSessionToken = null;
@@ -31,28 +33,28 @@ class ProxyServer {
     });
 
     this.server.listen(this.config.getPort(), () => {
-      console.log(`Multi-API proxy server running on port ${this.config.getPort()}`);
+      logger.info(`Multi-API proxy server running on port ${this.config.getPort()}`);
       
       const providers = this.config.getProviders();
       for (const [providerName, config] of providers.entries()) {
-        console.log(`Provider '${providerName}' (${config.apiType}): /${providerName}/* → ${config.baseUrl}`);
+        logger.info(`Provider '${providerName}' (${config.apiType}): /${providerName}/* → ${config.baseUrl}`);
       }
       
       // Backward compatibility logging
       if (this.config.hasGeminiKeys()) {
-        console.log(`Legacy Gemini endpoints: /gemini/*`);
+        logger.info(`Legacy Gemini endpoints: /gemini/*`);
       }
       if (this.config.hasOpenaiKeys()) {
-        console.log(`Legacy OpenAI endpoints: /openai/*`);
+        logger.info(`Legacy OpenAI endpoints: /openai/*`);
       }
       
       if (this.config.hasAdminPassword()) {
-        console.log(`Admin panel available at: http://localhost:${this.config.getPort()}/admin`);
+        logger.info(`Admin panel available at: http://localhost:${this.config.getPort()}/admin`);
       }
     });
 
     this.server.on('error', (error) => {
-      console.error('Server error:', error);
+      logger.error('Server error:', error);
     });
   }
 
@@ -76,7 +78,7 @@ class ProxyServer {
 
     // Only log to file for API calls, always log to console
     const isApiCall = this.parseRoute(req.url) !== null;
-    console.log(`[REQ-${requestId}] ${req.method} ${req.url} from ${clientIp}`);
+    logger.info(`[REQ-${requestId}] ${req.method} ${req.url} from ${clientIp}`);
 
     try {
       const body = await this.readRequestBody(req);
@@ -85,7 +87,7 @@ class ProxyServer {
       if (req.url === '/tailwind-3.4.17.js' && (req.method === 'GET' || req.method === 'HEAD')) {
         try {
           const filePath = path.join(process.cwd(), 'public', 'tailwind-3.4.17.js');
-          console.log(`[STATIC] Serving file from: ${filePath}`);
+          logger.info(`[STATIC] Serving file from: ${filePath}`);
 
           if (req.method === 'HEAD') {
             // For HEAD requests, just send headers without body
@@ -106,10 +108,10 @@ class ProxyServer {
             });
             res.end(fileContent);
           }
-          console.log(`[STATIC] Successfully served: ${req.url}`);
+          logger.info(`[STATIC] Successfully served: ${req.url}`);
           return;
         } catch (error) {
-          console.log(`[STATIC] Error serving file: ${error.message}`);
+          logger.info(`[STATIC] Error serving file: ${error.message}`);
           res.writeHead(404, { 'Content-Type': 'text/plain' });
           res.end('File not found');
           return;
@@ -139,8 +141,8 @@ class ProxyServer {
       const routeInfo = this.parseRoute(req.url);
       
       if (!routeInfo) {
-        console.log(`[REQ-${requestId}] Invalid path: ${req.url}`);
-        console.log(`[REQ-${requestId}] Response: 400 Bad Request - Invalid API path`);
+        logger.info(`[REQ-${requestId}] Invalid path: ${req.url}`);
+        logger.info(`[REQ-${requestId}] Response: 400 Bad Request - Invalid API path`);
         
         if (isApiCall) {
           const responseTime = Date.now() - startTime;
@@ -152,7 +154,7 @@ class ProxyServer {
       }
 
       const { providerName, apiType, path, provider, legacy } = routeInfo;
-      console.log(`[REQ-${requestId}] Proxying to provider '${providerName}' (${apiType.toUpperCase()}): ${path}`);
+      logger.info(`[REQ-${requestId}] Proxying to provider '${providerName}' (${apiType.toUpperCase()}): ${path}`);
 
       // Get the appropriate header based on API type
       const authHeader = apiType === 'gemini'
@@ -164,7 +166,7 @@ class ProxyServer {
 
       // Validate ACCESS_KEY for this provider
       if (!this.validateAccessKey(providerName, authHeader)) {
-        console.log(`[REQ-${requestId}] Response: 401 Unauthorized - Invalid or missing ACCESS_KEY for provider '${providerName}'`);
+        logger.info(`[REQ-${requestId}] Response: 401 Unauthorized - Invalid or missing ACCESS_KEY for provider '${providerName}'`);
 
         if (isApiCall) {
           const responseTime = Date.now() - startTime;
@@ -199,7 +201,7 @@ class ProxyServer {
       // Get or create client for this provider
       const client = await this.getProviderClient(providerName, provider, legacy);
       if (!client) {
-        console.log(`[REQ-${requestId}] Response: 503 Service Unavailable - Provider '${providerName}' not configured`);
+        logger.info(`[REQ-${requestId}] Response: 503 Service Unavailable - Provider '${providerName}' not configured`);
 
         if (isApiCall) {
           const responseTime = Date.now() - startTime;
@@ -212,7 +214,7 @@ class ProxyServer {
 
       // Pass custom status codes to client if provided
       if (customStatusCodes) {
-        console.log(`[REQ-${requestId}] Using custom status codes for rotation: ${Array.from(customStatusCodes).join(', ')}`);
+        logger.info(`[REQ-${requestId}] Using custom status codes for rotation: ${Array.from(customStatusCodes).join(', ')}`);
       }
 
       response = await client.makeRequest(req.method, path, body, headers, customStatusCodes);
@@ -227,8 +229,8 @@ class ProxyServer {
       this.logApiResponse(requestId, response, body);
       this.sendResponse(res, response);
     } catch (error) {
-      console.log(`[REQ-${requestId}] Request handling error: ${error.message}`);
-      console.log(`[REQ-${requestId}] Response: 500 Internal Server Error`);
+      logger.info(`[REQ-${requestId}] Request handling error: ${error.message}`);
+      logger.info(`[REQ-${requestId}] Response: 500 Internal Server Error`);
       
       if (isApiCall) {
         const responseTime = Date.now() - startTime;
@@ -333,18 +335,18 @@ class ProxyServer {
       let client;
 
       if (provider.apiType === 'openai') {
-        client = new this.OpenAIClient(keyRotator, provider.baseUrl);
+        client = new this.OpenAIClient(keyRotator, provider.baseUrl, this.proxyAgent);
       } else if (provider.apiType === 'gemini') {
-        client = new this.GeminiClient(keyRotator, provider.baseUrl);
+        client = new this.GeminiClient(keyRotator, provider.baseUrl, this.proxyAgent);
       } else {
         return null;
       }
 
       this.providerClients.set(providerName, client);
-      console.log(`[SERVER] Created client for provider '${providerName}' (${provider.apiType})`);
+      logger.info(`[SERVER] Created client for provider '${providerName}' (${provider.apiType})`);
       return client;
     } catch (error) {
-      console.error(`[SERVER] Failed to create client for provider '${providerName}': ${error.message}`);
+      logger.error(`[SERVER] Failed to create client for provider '${providerName}': ${error.message}`);
       return null;
     }
   }
@@ -476,7 +478,7 @@ class ProxyServer {
   }
 
   sendError(res, statusCode, message) {
-    console.log(`[SERVER] Sending error response: ${statusCode} - ${message}`);
+    logger.info(`[SERVER] Sending error response: ${statusCode} - ${message}`);
     
     const errorResponse = {
       error: {
@@ -507,11 +509,19 @@ class ProxyServer {
     });
     
     // Log basic response info to console only (structured logging handled in handleRequest)
-    const responseMsg = `[REQ-${requestId}] Response: ${response.statusCode} ${this.getStatusText(response.statusCode)}`;
+    let responseMsg = `[REQ-${requestId}] Response: ${response.statusCode} ${this.getStatusText(response.statusCode)}`;
+    if (response.statusCode === 429 && response.data) {
+      try {
+        const shortJson = JSON.stringify(JSON.parse(response.data));
+        responseMsg += ` - ${shortJson}`;
+      } catch (e) {
+        responseMsg += ` - ${response.data.toString().replace(/\\r?\\n|\\r/g, '')}`;
+      }
+    }
     const contentMsg = `[REQ-${requestId}] Content-Type: ${contentType}, Size: ${contentLength} bytes`;
-    
-    console.log(responseMsg);
-    console.log(contentMsg);
+
+    logger.info(responseMsg);
+    logger.info(contentMsg);
     
     // For error responses, log the error details to console
     if (response.statusCode >= 400) {
@@ -519,20 +529,20 @@ class ProxyServer {
         const errorData = JSON.parse(response.data);
         if (errorData.error) {
           const errorMsg = `[REQ-${requestId}] Error: ${errorData.error.message || errorData.error.code || 'Unknown error'}`;
-          console.log(errorMsg);
+          logger.info(errorMsg);
         }
       } catch (e) {
         // If response is not JSON, log first 200 chars of response
         const errorText = response.data ? response.data.toString().substring(0, 200) : 'No error details';
         const errorMsg = `[REQ-${requestId}] Error details: ${errorText}`;
-        console.log(errorMsg);
+        logger.info(errorMsg);
       }
     }
     
     // For successful responses, log basic success info to console
     if (response.statusCode >= 200 && response.statusCode < 300) {
       const successMsg = `[REQ-${requestId}] Request completed successfully`;
-      console.log(successMsg);
+      logger.info(successMsg);
     }
   }
 
@@ -694,7 +704,7 @@ class ProxyServer {
         // Block if reached 5 attempts
         if (this.failedLoginAttempts >= 5) {
           this.loginBlockedUntil = Date.now() + (5 * 60 * 1000); // 5 minutes
-          console.log('[SECURITY] Login blocked due to 5 failed attempts. Blocked until:', new Date(this.loginBlockedUntil).toISOString());
+          logger.info('[SECURITY] Login blocked due to 5 failed attempts. Blocked until:', new Date(this.loginBlockedUntil).toISOString());
           res.writeHead(429, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({
             error: 'Too many failed login attempts. Please wait 5 minutes.',
@@ -702,7 +712,7 @@ class ProxyServer {
             remainingSeconds: 300
           }));
         } else {
-          console.log(`[SECURITY] Failed login attempt ${this.failedLoginAttempts}/5`);
+          logger.info(`[SECURITY] Failed login attempt ${this.failedLoginAttempts}/5`);
           res.writeHead(401, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({
             error: `Invalid password. ${attemptsRemaining} attempt(s) remaining.`,
@@ -997,7 +1007,7 @@ class ProxyServer {
       const error = !testResponse.ok ? `API test failed: ${testResponse.status} ${testResponse.statusText}` : null;
       this.logApiRequest(testId, 'GET', testPath, 'gemini', testResponse.status, responseTime, error, 'admin-test');
       
-      console.log(`[TEST-${testId}] GET ${testPath} (Gemini) → ${testResponse.status} ${testResponse.statusText} | ${contentType} ${responseText.length}b`);
+      logger.info(`[TEST-${testId}] GET ${testPath} (Gemini) → ${testResponse.status} ${testResponse.statusText} | ${contentType} ${responseText.length}b`);
       
       return { 
         success: testResponse.ok, 
@@ -1006,7 +1016,7 @@ class ProxyServer {
     } catch (error) {
       const responseTime = Date.now() - startTime;
       
-      console.log(`[TEST-${testId}] GET ${testPath} (Gemini) → ERROR: ${error.message}`);
+      logger.info(`[TEST-${testId}] GET ${testPath} (Gemini) → ERROR: ${error.message}`);
       this.logApiRequest(testId, 'GET', testPath, 'gemini', null, responseTime, error.message, 'admin-test');
       
       return { success: false, error: error.message };
@@ -1054,7 +1064,7 @@ class ProxyServer {
       const error = !testResponse.ok ? `API test failed: ${testResponse.status} ${testResponse.statusText}` : null;
       this.logApiRequest(testId, 'GET', testPath, 'openai', testResponse.status, responseTime, error, 'admin-test');
       
-      console.log(`[TEST-${testId}] GET ${testPath} (OpenAI) → ${testResponse.status} ${testResponse.statusText} | ${contentType} ${responseText.length}b`);
+      logger.info(`[TEST-${testId}] GET ${testPath} (OpenAI) → ${testResponse.status} ${testResponse.statusText} | ${contentType} ${responseText.length}b`);
       
       return { 
         success: testResponse.ok, 
@@ -1063,7 +1073,7 @@ class ProxyServer {
     } catch (error) {
       const responseTime = Date.now() - startTime;
       
-      console.log(`[TEST-${testId}] GET ${testPath} (OpenAI) → ERROR: ${error.message}`);
+      logger.info(`[TEST-${testId}] GET ${testPath} (OpenAI) → ERROR: ${error.message}`);
       this.logApiRequest(testId, 'GET', testPath, 'openai', null, responseTime, error.message, 'admin-test');
       
       return { success: false, error: error.message };
@@ -1115,7 +1125,7 @@ class ProxyServer {
         format: 'json' // Indicate the new format
       }));
     } catch (error) {
-      console.error('Failed to get logs:', error.message);
+      logger.error('Failed to get logs:', error.message);
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ 
         error: 'Failed to retrieve logs',
@@ -1220,7 +1230,7 @@ class ProxyServer {
    * Called after environment variables are updated via admin panel
    */
   reinitializeClients() {
-    console.log('[SERVER] Reinitializing API clients with updated configuration...');
+    logger.info('[SERVER] Reinitializing API clients with updated configuration...');
     
     // Clear all provider clients
     this.providerClients.clear();
@@ -1228,23 +1238,23 @@ class ProxyServer {
     // Reinitialize legacy clients for backward compatibility
     if (this.config.hasGeminiKeys()) {
       const geminiKeyRotator = new this.KeyRotator(this.config.getGeminiApiKeys(), 'gemini');
-      this.geminiClient = new this.GeminiClient(geminiKeyRotator, this.config.getGeminiBaseUrl());
-      console.log('[SERVER] Legacy Gemini client reinitialized');
+      this.geminiClient = new this.GeminiClient(geminiKeyRotator, this.config.getGeminiBaseUrl(), this.proxyAgent);
+      logger.info('[SERVER] Legacy Gemini client reinitialized');
     } else {
       this.geminiClient = null;
-      console.log('[SERVER] Legacy Gemini client disabled (no keys available)');
+      logger.info('[SERVER] Legacy Gemini client disabled (no keys available)');
     }
     
     if (this.config.hasOpenaiKeys()) {
       const openaiKeyRotator = new this.KeyRotator(this.config.getOpenaiApiKeys(), 'openai');
-      this.openaiClient = new this.OpenAIClient(openaiKeyRotator, this.config.getOpenaiBaseUrl());
-      console.log('[SERVER] Legacy OpenAI client reinitialized');
+      this.openaiClient = new this.OpenAIClient(openaiKeyRotator, this.config.getOpenaiBaseUrl(), this.proxyAgent);
+      logger.info('[SERVER] Legacy OpenAI client reinitialized');
     } else {
       this.openaiClient = null;
-      console.log('[SERVER] Legacy OpenAI client disabled (no keys available)');
+      logger.info('[SERVER] Legacy OpenAI client disabled (no keys available)');
     }
     
-    console.log(`[SERVER] ${this.config.getProviders().size} providers available for dynamic initialization`);
+    logger.info(`[SERVER] ${this.config.getProviders().size} providers available for dynamic initialization`);
   }
 
   stop() {

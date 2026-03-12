@@ -1,115 +1,161 @@
 const https = require('https');
 const { URL } = require('url');
+const logger = require('./logger');
 
 class GeminiClient {
-  constructor(keyRotator, baseUrl = 'https://generativelanguage.googleapis.com') {
+  constructor(keyRotator, baseUrl = 'https://generativelanguage.googleapis.com', proxyAgent = null) {
     this.keyRotator = keyRotator;
     this.baseUrl = baseUrl;
+    this.proxyAgent = proxyAgent;
   }
 
   async makeRequest(method, path, body, headers = {}, customStatusCodes = null) {
-    let pathsToTry = [path];
-    
-    if (path && path.includes('/models/mypro:')) {
-      pathsToTry = [
-        path.replace(/\/models\/mypro:/, '/models/gemini-3.1-pro-preview:'),
-        path.replace(/\/models\/mypro:/, '/models/gemini-3-pro-preview:'),
-        path.replace(/\/models\/mypro:/, '/models/gemini-2.5-pro:')
-      ];
-      console.log(`[GEMINI] "pro" model requested. Will try fallback strategy: ${pathsToTry.join(' then ')}`);
+    // Identify requested model and determine fallback chain
+    let requestedModel = 'unknown';
+    const modelMatch = path.match(/\/models\/([^:]+):/);
+    if (modelMatch) requestedModel = modelMatch[1];
+
+    let modelsToTry = [requestedModel];
+    if (requestedModel === 'mypro') {
+      modelsToTry = ['gemini-3.1-pro-preview', 'gemini-2.5-pro'];
+      logger.info(`[GEMINI] "mypro" requested. Fallback chain: ${modelsToTry.join(' -> ')}`);
+    } else if (requestedModel === 'my') {
+      modelsToTry = ['gemini-3.1-pro-preview', 'gemini-2.5-pro', 'gemini-3-flash-preview', 'gemini-2.5-flash'];
+      logger.info(`[GEMINI] "my" requested. Fallback chain: ${modelsToTry.join(' -> ')}`);
     }
 
-    const rotationStatusCodes = customStatusCodes || new Set([429]);
+    const rotationStatusCodes = customStatusCodes || new Set([429, 403]);
     let lastError = null;
     let lastResponse = null;
 
-    let isFirstAttempt = true;
-    for (let pathIndex = 0; pathIndex < pathsToTry.length; pathIndex++) {
-      const currentPath = pathsToTry[pathIndex];
-      const requestContext = this.keyRotator.createRequestContext();
-      let apiKey;
-      
-      while ((apiKey = requestContext.getNextKey()) !== null) {
-        if (!isFirstAttempt) {
-          console.log('[GEMINI] Waiting 1 second before trying next key...');
-          await new Promise(resolve => setTimeout(resolve, 2000));
-        }
-        isFirstAttempt = false;
+    // Retry loop for the entire chain
+    for (let retryLoop = 0; retryLoop < 2; retryLoop++) {
+      let isFirstAttempt = true;
+      let allModelsExhausted = true;
 
-        const maskedKey = this.maskApiKey(apiKey);
-
-        console.log(`[GEMINI::${maskedKey}] Attempting ${method} ${currentPath}`);
-
-        try {
-          let response = await this.sendRequest(method, currentPath, body, headers, apiKey, false);
-          
-          if (response.statusCode === 503 && response.data && response.data.includes('high demand')) {
-            console.log(`[GEMINI::${maskedKey}] Model overloaded (503). Waiting 10 seconds before retrying...`);
-            await new Promise(resolve => setTimeout(resolve, 20000));
-            console.log(`[GEMINI::${maskedKey}] Retrying ${method} ${currentPath} after delay...`);
-            response = await this.sendRequest(method, currentPath, body, headers, apiKey, false);
+      for (const model of modelsToTry) {
+        const currentPath = path.replace(/\/models\/[^:]+:/, `/models/${model}:`);
+        const requestContext = this.keyRotator.createRequestContext(model);
+        let apiKey;
+        
+        // Try each available key for the current model
+        while ((apiKey = requestContext.getNextKey()) !== null) {
+          allModelsExhausted = false;
+          if (!isFirstAttempt) {
+            await new Promise(resolve => setTimeout(resolve, 1000));
           }
-          
-          requestContext.recordKeyStatus(apiKey, response.statusCode);
+          isFirstAttempt = false;
 
-          if (rotationStatusCodes.has(response.statusCode)) {
-            console.log(`[GEMINI::${maskedKey}] Status ${response.statusCode} triggers rotation - trying next key. Response: ${response.data}`);
-            requestContext.markKeyAsRateLimited(apiKey);
+          const stats = this.keyRotator.constructor.getUsageStats(apiKey, model);
+          const countStr = Object.entries(stats.requests).map(([status, count]) => `${status}:${count}`).join(', ') || 'None';
+          const tokenStr = stats.tokens.total > 0 ? ` | Tokens: In=${stats.tokens.in}, Out=${stats.tokens.out}, Total=${stats.tokens.total}` : '';
+          const maskedKey = this.maskApiKey(apiKey);
+          logger.info(`[GEMINI::${maskedKey}] Attempting ${method} ${model} (ReqPerHttpCode: ${countStr}${tokenStr})`);
+
+          try {
+            let response = await this.sendRequest(method, currentPath, body, headers, apiKey, false);
+            
+            // Handle 503 Service Unavailable (High Demand)
+            if (response.statusCode === 503 && response.data && response.data.includes('high demand')) {
+              this.keyRotator.constructor.recordRequestStatus(apiKey, model, 503);
+              logger.info(`[GEMINI::${maskedKey}] Model overloaded (503). Waiting 1s and rotating key...`);
+              await new Promise(resolve => setTimeout(resolve, 1000));
+              requestContext.recordKeyStatus(apiKey, '503 (High Demand)');
+              lastResponse = response;
+              continue; // Move to next key for same model
+            }
+            
+            requestContext.recordKeyStatus(apiKey, response.statusCode);
+
+            // Handle 429 Too Many Requests (Rate Limit)
+            if (rotationStatusCodes.has(response.statusCode)) {
+              this.keyRotator.constructor.recordRequestStatus(apiKey, model, response.statusCode);
+              this.keyRotator.constructor.markRateLimited(apiKey, model);
+              logger.info(`[GEMINI::${maskedKey}] Status ${response.statusCode} triggers rotation. Trying next key.`);
+              if (response.statusCode === 403) {
+                const responseData = response.data ? (typeof response.data === 'string' ? response.data : JSON.stringify(response.data)) : '';
+                const oneLineData = responseData.replace(/\r?\n|\r/g, '');
+                logger.info(`[GEMINI::${maskedKey}] ccc ${oneLineData}`);
+              }
+              requestContext.markKeyAsRateLimited(apiKey);
+              this.keyRotator.incrementFailureCount(apiKey);
+              lastResponse = response;
+              continue;
+            }
+
+            this.keyRotator.constructor.recordRequestStatus(apiKey, model, response.statusCode);
+            
+            let tokenInfo = '';
+            if (response.statusCode >= 200 && response.statusCode < 300 && response.data) {
+              try {
+                const parsed = JSON.parse(response.data);
+                if (parsed.usageMetadata) {
+                  const { promptTokenCount, candidatesTokenCount, totalTokenCount } = parsed.usageMetadata;
+                  this.keyRotator.constructor.recordTokens(apiKey, model, promptTokenCount, candidatesTokenCount, totalTokenCount);
+                  const updatedStats = this.keyRotator.constructor.getUsageStats(apiKey, model);
+                  tokenInfo = ` [Tokens: In=${promptTokenCount || 0}, Out=${candidatesTokenCount || 0}, Total=${totalTokenCount || 0}] [SumTokens: In=${updatedStats.tokens.in}, Out=${updatedStats.tokens.out}, Total=${updatedStats.tokens.total}]`;
+                }
+              } catch (e) { /* ignore parse error */ }
+            }
+
+            logger.info(`[GEMINI::${maskedKey}] Success (${response.statusCode})${tokenInfo}`);
+            this.keyRotator.resetFailureCount(apiKey);
+            return response;
+
+          } catch (error) {
+            this.keyRotator.constructor.recordRequestStatus(apiKey, model, 'error');
+            logger.info(`[GEMINI::${maskedKey}] Request failed: ${error.message}`);
+            lastError = error;
+            requestContext.recordKeyStatus(apiKey, error.message);
             this.keyRotator.incrementFailureCount(apiKey);
-            lastResponse = response;
             continue;
           }
+        }
+        
+        const stats = requestContext.getStats();
+        if (stats.triedKeys > 0) {
+          let statusLog = [];
+          for (const [key, status] of stats.keyStatuses.entries()) {
+            statusLog.push(`${this.maskApiKey(key)}=${status}`);
+          }
+          logger.info(`[GEMINI] All available keys tried for ${model}. Statuses: [${statusLog.join(', ')}]`);
+        }
+      }
 
-          console.log(`[GEMINI::${maskedKey}] Success (${response.statusCode})`);
-          this.keyRotator.resetFailureCount(requestContext.getWorkingKey());
-          return response;
-        } catch (error) {
-          console.log(`[GEMINI::${maskedKey}] Request failed: ${error.message}`);
-          lastError = error;
-          requestContext.recordKeyStatus(apiKey, error.message);
-          this.keyRotator.incrementFailureCount(apiKey);
-          continue;
+      // Step 5: Global Waiting Strategy
+      if (allModelsExhausted && retryLoop === 0) {
+        let minWait = 60 * 60 * 1000; // Start with max possible cooldown (10m)
+        let foundCooldown = false;
+        for (const model of modelsToTry) {
+          for (const key of this.keyRotator.apiKeys) {
+            const wait = this.keyRotator.constructor.getRemainingCooldown(key, model);
+            if (wait > 0) {
+              if (wait < minWait) minWait = wait;
+              foundCooldown = true;
+            }
+          }
+        }
+        
+        if (foundCooldown && minWait < 60000) {
+          logger.info(`[GEMINI] All keys for all models in chain are in cooldown. Waiting ${Math.ceil(minWait/1000)}s for next available...`);
+          await new Promise(resolve => setTimeout(resolve, minWait + 500));
+          continue; // Retry the entire chain
         }
       }
       
-      const stats = requestContext.getStats();
-      let statusLog = [];
-      if (stats.keyStatuses) {
-        for (const [key, status] of stats.keyStatuses.entries()) {
-          statusLog.push(`${this.maskApiKey(key)}=${status}`);
-        }
-      }
-      const statusString = statusLog.length > 0 ? ` Statuses: [${statusLog.join(', ')}]` : '';
-      console.log(`[GEMINI] All ${stats.totalKeys} keys tried for ${currentPath}. ${stats.rateLimitedKeys} were rate limited.${statusString}`);
-      
-      if (requestContext.allTriedKeysRateLimited()) {
-        if (pathIndex < pathsToTry.length - 1) {
-          console.log(`[GEMINI] All keys rate limited for ${currentPath}, falling back to next model in sequence...`);
-          continue;
-        } else {
-          console.log('[GEMINI] All keys rate limited for all models - returning 429');
-          return lastResponse || {
-            statusCode: 429,
-            headers: { 'content-type': 'application/json' },
-            data: JSON.stringify({
-              error: {
-                code: 429,
-                message: 'All API keys have been rate limited for this request',
-                status: 'RESOURCE_EXHAUSTED'
-              }
-            })
-          };
-        }
-      }
-      
-      if (lastError && pathIndex === pathsToTry.length - 1) {
-        throw lastError;
-      }
-      
-      if (pathIndex === pathsToTry.length - 1) {
-        throw new Error('All API keys exhausted without clear error');
-      }
+      break; // Exit retry loop
     }
+
+    // Final failure handling
+    if (lastResponse || lastError) {
+      return lastResponse || {
+        statusCode: 500,
+        headers: { 'content-type': 'application/json' },
+        data: JSON.stringify({ error: { message: lastError ? lastError.message : 'All keys exhausted' } })
+      };
+    }
+
+    throw new Error('All API keys exhausted without clear error');
   }
 
   sendRequest(method, path, body, headers, apiKey, useHeader = false) {
@@ -166,7 +212,9 @@ class GeminiClient {
         port: url.port || 443,
         path: url.pathname + url.search,
         method: method,
-        headers: finalHeaders
+        headers: finalHeaders,
+        agent: this.proxyAgent,
+        timeout: 60000
       };
 
       if (body && method !== 'GET') {
@@ -192,8 +240,12 @@ class GeminiClient {
 
       req.on('error', (error) => {
         const maskedKey = this.maskApiKey(apiKey);
-        console.log(`[GEMINI::${maskedKey}] HTTP request error: ${error.message}`);
+        logger.info(`[GEMINI::${maskedKey}] HTTP request error: ${error.message}`);
         reject(error);
+      });
+
+      req.on('timeout', () => {
+        req.destroy(new Error('Request timeout after 60000ms'));
       });
 
       if (body && method !== 'GET') {
