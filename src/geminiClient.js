@@ -17,10 +17,10 @@ class GeminiClient {
 
     let modelsToTry = [requestedModel];
     if (requestedModel === 'mypro') {
-      modelsToTry = ['gemini-3.1-pro-preview', 'gemini-2.5-pro'];
+      modelsToTry = [ 'gemini-3.1-pro-preview', 'gemini-3-pro-preview', 'gemini-2.5-pro'];
       logger.info(`[GEMINI] "mypro" requested. Fallback chain: ${modelsToTry.join(' -> ')}`);
     } else if (requestedModel === 'my') {
-      modelsToTry = ['gemini-3.1-pro-preview', 'gemini-2.5-pro', 'gemini-3-flash-preview', 'gemini-2.5-flash'];
+      modelsToTry = [ 'gemini-3.1-pro-preview', 'gemini-3-pro-preview', 'gemini-2.5-pro', 'gemini-3-flash-preview', 'gemini-2.5-flash'];
       logger.info(`[GEMINI] "my" requested. Fallback chain: ${modelsToTry.join(' -> ')}`);
     }
 
