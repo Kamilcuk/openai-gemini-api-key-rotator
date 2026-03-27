@@ -4,4 +4,6 @@
 *.log
 /.serena
 state.json
+state.json.sav
 plan.md
+.env.sav

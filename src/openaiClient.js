@@ -1,6 +1,7 @@
 const https = require('https');
 const { URL } = require('url');
 const logger = require('./logger');
+const { resolveModelChain } = require('./modelAliases');
 
 class OpenAIClient {
   constructor(keyRotator, baseUrl = 'https://api.openai.com', proxyAgent = null) {
@@ -10,79 +11,138 @@ class OpenAIClient {
   }
 
   async makeRequest(method, path, body, headers = {}, customStatusCodes = null) {
-    // Create a new request context for this specific request
-    const requestContext = this.keyRotator.createRequestContext();
+    let parsedBody = typeof body === 'string' ? {} : (body || {});
+    if (typeof body === 'string' && body.trim() !== '') {
+      try {
+        parsedBody = JSON.parse(body);
+      } catch (e) {
+        logger.error(`[OPENAI] Failed to parse request body: ${e.message}`);
+      }
+    }
+
+    // Identify requested model and determine fallback chain
+    let requestedModel = parsedBody.model || 'unknown';
+
+    let modelsToTry = resolveModelChain(requestedModel);
+    if (modelsToTry.length > 1) {
+      logger.info(`[OPENAI] Alias "${requestedModel}" requested. Fallback chain: ${modelsToTry.join(' -> ')}`);
+    }
+
+    const rotationStatusCodes = customStatusCodes || new Set([429, 403]);
     let lastError = null;
     let lastResponse = null;
 
-    // Determine which status codes should trigger rotation
-    // Default is just 429, but can be overridden
-    const rotationStatusCodes = customStatusCodes || new Set([429]);
+    // Retry loop for the entire chain
+    for (let retryLoop = 0; retryLoop < 2; retryLoop++) {
+      let isFirstAttempt = true;
+      let allModelsExhausted = true;
 
-    // Try each available key for this request
-    let isFirstAttempt = true;
-    let apiKey;
-    while ((apiKey = requestContext.getNextKey()) !== null) {
-      if (!isFirstAttempt) {
-        logger.info('[OPENAI] Waiting 1 second before trying next key...');
-        await new Promise(resolve => setTimeout(resolve, 1000));
-      }
-      isFirstAttempt = false;
-
-      const maskedKey = this.maskApiKey(apiKey);
-
-      logger.info(`[OPENAI::${maskedKey}] Attempting ${method} ${path}`);
-
-      try {
-        const response = await this.sendRequest(method, path, body, headers, apiKey);
-
-        // Check if this status code should trigger rotation
-        if (rotationStatusCodes.has(response.statusCode)) {
-          logger.info(`[OPENAI::${maskedKey}] Status ${response.statusCode} triggers rotation - trying next key. Response: ${response.data}`);
-          requestContext.markKeyAsRateLimited(apiKey);
-          this.keyRotator.incrementFailureCount(apiKey);
-          lastResponse = response; // Keep the response in case all keys fail
-          continue;
-        }
-
-        logger.info(`[OPENAI::${maskedKey}] Success (${response.statusCode})`);
-        this.keyRotator.resetFailureCount(requestContext.getWorkingKey());
-        return response;
-      } catch (error) {
-        logger.info(`[OPENAI::${maskedKey}] Request failed: ${error.message}`);
-        lastError = error;
-        // For network errors, we still try the next key
-        this.keyRotator.incrementFailureCount(apiKey);
-        continue;
-      }
-    }
-    
-    // All keys have been tried for this request
-    const stats = requestContext.getStats();
-    logger.info(`[OPENAI] All ${stats.totalKeys} keys tried for this request. ${stats.rateLimitedKeys} were rate limited.`);
-    
-    // If all tried keys were rate limited, return 429
-    if (requestContext.allTriedKeysRateLimited()) {
-      logger.info('[OPENAI] All keys rate limited for this request - returning 429');
-      return lastResponse || {
-        statusCode: 429,
-        headers: { 'content-type': 'application/json' },
-        data: JSON.stringify({
-          error: {
-            message: 'All OpenAI API keys have been rate limited for this request',
-            type: 'rate_limit_exceeded',
-            code: 'rate_limit_exceeded'
+      for (const model of modelsToTry) {
+        const requestContext = this.keyRotator.createRequestContext(model);
+        let apiKey;
+        
+        // Try each available key for the current model
+        while ((apiKey = requestContext.getNextKey()) !== null) {
+          allModelsExhausted = false;
+          if (!isFirstAttempt) {
+            await new Promise(resolve => setTimeout(resolve, 1000));
           }
-        })
+          isFirstAttempt = false;
+
+          const stats = this.keyRotator.constructor.getUsageStats(apiKey, model);
+          const countStr = Object.entries(stats.requests).map(([status, count]) => `${status}:${count}`).join(', ') || 'None';
+          const tokenStr = ` | Tokens: In=${stats.tokens.in}, Out=${stats.tokens.out}, Total=${stats.tokens.total}`;
+          const maskedKey = this.maskApiKey(apiKey);
+          logger.info(`[OPENAI::${maskedKey}] Attempting ${method} ${this.baseUrl}${path} with model ${model} (ReqPerHttpCode: ${countStr}${tokenStr})`);
+
+          try {
+            const newBody = typeof parsedBody === 'object' ? { ...parsedBody, model: model } : parsedBody;
+            const response = await this.sendRequest(method, path, newBody, headers, apiKey);
+            
+            requestContext.recordKeyStatus(apiKey, response.statusCode);
+
+            if (rotationStatusCodes.has(response.statusCode)) {
+              this.keyRotator.constructor.recordRequestStatus(apiKey, model, response.statusCode);
+              this.keyRotator.constructor.markRateLimited(apiKey, model);
+              logger.info(`[OPENAI::${maskedKey}] Status ${response.statusCode} triggers rotation. Trying next key.`);
+              requestContext.markKeyAsRateLimited(apiKey);
+              this.keyRotator.incrementFailureCount(apiKey);
+              lastResponse = response;
+              continue;
+            }
+
+            this.keyRotator.constructor.recordRequestStatus(apiKey, model, response.statusCode);
+            
+            let tokenInfo = '';
+            if (response.statusCode >= 200 && response.statusCode < 300 && response.data) {
+              try {
+                const parsed = JSON.parse(response.data);
+                if (parsed.usage) {
+                  const { prompt_tokens, completion_tokens, total_tokens } = parsed.usage;
+                  this.keyRotator.constructor.recordTokens(apiKey, model, prompt_tokens, completion_tokens, total_tokens);
+                  const updatedStats = this.keyRotator.constructor.getUsageStats(apiKey, model);
+                  tokenInfo = ` [Tokens: In=${prompt_tokens || 0}, Out=${completion_tokens || 0}, Total=${total_tokens || 0}] [SumTokens: In=${updatedStats.tokens.in}, Out=${updatedStats.tokens.out}, Total=${updatedStats.tokens.total}]`;
+                }
+              } catch (e) { /* ignore parse error */ }
+            }
+
+            logger.info(`[OPENAI::${maskedKey}] Success (${response.statusCode})${tokenInfo}`);
+            this.keyRotator.resetFailureCount(apiKey);
+            return response;
+
+          } catch (error) {
+            this.keyRotator.constructor.recordRequestStatus(apiKey, model, 'error');
+            logger.info(`[OPENAI::${maskedKey}] Request failed: ${error.message}`);
+            lastError = error;
+            requestContext.recordKeyStatus(apiKey, error.message);
+            this.keyRotator.incrementFailureCount(apiKey);
+            continue;
+          }
+        }
+        
+        const stats = requestContext.getStats();
+        if (stats.triedKeys > 0) {
+          let statusLog = [];
+          for (const [key, status] of stats.keyStatuses.entries()) {
+            statusLog.push(`${this.maskApiKey(key)}=${status}`);
+          }
+          logger.info(`[OPENAI] All available keys tried for ${model}. Statuses: [${statusLog.join(', ')}]`);
+        }
+      }
+
+      // Global Waiting Strategy
+      if (allModelsExhausted && retryLoop === 0) {
+        let minWait = 60 * 60 * 1000;
+        let foundCooldown = false;
+        for (const model of modelsToTry) {
+          for (const key of this.keyRotator.apiKeys) {
+            const wait = this.keyRotator.constructor.getRemainingCooldown(key, model);
+            if (wait > 0) {
+              if (wait < minWait) minWait = wait;
+              foundCooldown = true;
+            }
+          }
+        }
+        
+        if (foundCooldown && minWait < 60000) {
+          logger.info(`[OPENAI] All keys for all models in chain are in cooldown. Waiting ${Math.ceil(minWait/1000)}s for next available...`);
+          await new Promise(resolve => setTimeout(resolve, minWait + 500));
+          continue; // Retry the entire chain
+        }
+      }
+      
+      break; // Exit retry loop
+    }
+
+    // Final failure handling
+    if (lastResponse || lastError) {
+      return lastResponse || {
+        statusCode: 500,
+        headers: { 'content-type': 'application/json' },
+        data: JSON.stringify({ error: { message: lastError ? lastError.message : 'All keys exhausted' } })
       };
     }
-    
-    // If we had other types of errors, throw the last one
-    if (lastError) {
-      throw lastError;
-    }
-    
-    // Fallback error
+
     throw new Error('All API keys exhausted without clear error');
   }
 
@@ -159,6 +219,18 @@ class OpenAIClient {
   maskApiKey(key) {
     if (!key || key.length < 4) return '**';
     return '**' + key.substring(key.length - 4);
+  }
+
+  getTargetUrl(method, path) {
+    let fullUrl;
+    if (!path || path === '/') {
+      fullUrl = this.baseUrl;
+    } else if (path.startsWith('/')) {
+      fullUrl = this.baseUrl.endsWith('/') ? this.baseUrl + path.substring(1) : this.baseUrl + path;
+    } else {
+      fullUrl = this.baseUrl.endsWith('/') ? this.baseUrl + path : this.baseUrl + '/' + path;
+    }
+    return fullUrl;
   }
 }
 

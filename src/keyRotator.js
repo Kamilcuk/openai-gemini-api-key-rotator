@@ -5,7 +5,8 @@ const path = require('path');
 // Global state for rate limits shared across all instances
 const globalCooldowns = new Map();
 const globalUsageStats = new Map(); // Stores { requests: { [status]: number }, tokens: { in: number, out: number, total: number } }
-const COOLDOWN_DURATION = 60 * 60 * 1000; // 60 minutes
+const globalKeyComments = new Map(); // Stores { [apiKey]: string }
+const COOLDOWN_DURATION = 5 * 60 * 1000; // X minutes * 60 * 1000
 const STATE_FILE = path.join(process.cwd(), 'state.json');
 
 // Load state from file on startup
@@ -62,6 +63,13 @@ function loadState() {
         }
       }
 
+      if (data.globalKeyComments) {
+        for (const [key, comment] of Object.entries(data.globalKeyComments)) {
+          globalKeyComments.set(key, comment);
+        }
+        logger.info(`[STATE] Loaded ${globalKeyComments.size} key comments from state.json`);
+      }
+
       // Print loaded counts
       for (const [key, stats] of globalUsageStats.entries()) {
         const [apiKey, model] = key.split(':');
@@ -85,11 +93,15 @@ function saveState() {
         activeCooldowns[key] = timestamp;
       }
     }
+    const keyComments = {};
+    for (const [key, comment] of globalKeyComments.entries()) {
+      keyComments[key] = comment;
+    }
     const usageStats = {};
     for (const [key, stats] of globalUsageStats.entries()) {
       usageStats[key] = stats;
     }
-    fs.writeFileSync(STATE_FILE, JSON.stringify({ globalCooldowns: activeCooldowns, globalUsageStats: usageStats }, null, 2));
+    fs.writeFileSync(STATE_FILE, JSON.stringify({ globalCooldowns: activeCooldowns, globalUsageStats: usageStats, globalKeyComments: keyComments }, null, 2));
   } catch (error) {
     logger.info(`[STATE] Failed to save state.json: ${error.message}`);
   }
@@ -109,6 +121,34 @@ class KeyRotator {
   /**
    * Gets the unified usage statistics for a given key and model combination
    */
+  static getAllComments() {
+    const comments = {};
+    for (const [key, comment] of globalKeyComments.entries()) {
+      comments[key] = comment;
+    }
+    return comments;
+  }
+
+  static getKeyComment(apiKey) {
+    return globalKeyComments.get(apiKey) || '';
+  }
+
+  static setKeyComment(apiKey, comment) {
+    globalKeyComments.set(apiKey, comment);
+    saveState();
+  }
+
+  /**
+   * Gets the unified usage statistics for a given key and model combination
+   */
+  static getAllStats() {
+    const stats = {};
+    for (const [key, value] of globalUsageStats.entries()) {
+      stats[key] = value;
+    }
+    return stats;
+  }
+
   static getUsageStats(apiKey, modelName) {
     const compositeKey = `${apiKey}:${modelName}`;
     return globalUsageStats.get(compositeKey) || { requests: {}, tokens: { in: 0, out: 0, total: 0 } };
@@ -151,7 +191,7 @@ class KeyRotator {
     globalCooldowns.set(compositeKey, Date.now());
     saveState();
     const maskedKey = KeyRotator.maskKeyStatic(apiKey);
-    logger.info(`[RATELIMIT] Key ${maskedKey} for model ${modelName} marked as rate limited for 60 minutes`);
+    logger.info(`[RATELIMIT] Key ${maskedKey} for model ${modelName} marked as rate limited for ${COOLDOWN_DURATION / 1000} seconds`);
   }
 
   /**

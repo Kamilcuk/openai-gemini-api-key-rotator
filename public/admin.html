@@ -448,6 +448,15 @@
                             </svg>
                             <span class="text-sm">API Logs</span>
                         </button>
+                        <button 
+                            onclick="showTab('stats')" 
+                            class="tab-btn py-3 px-2 border-b-2 border-transparent text-muted-foreground hover:text-foreground hover:border-border transition-colors flex items-center space-x-2"
+                            data-tab="stats"
+                        >
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6"></path></svg>
+                            <span class="text-sm">Stats</span>
+                        </button>
+                        
                     </nav>
                     
                     <!-- Header Notifications Area (placeholder for positioning) -->
@@ -609,7 +618,41 @@
                     </div>
                 </div>
             </div>
-        </main>
+        
+            <!-- Stats Tab -->
+            <div id="stats" class="tab-content hidden">
+                <div class="section-header">
+                    <h2 class="text-lg font-semibold text-foreground">API Key Statistics</h2>
+                    <p class="text-muted-foreground text-xs mt-1">View usage statistics and token counts</p>
+                    <button onclick="fetchStats()" class="btn btn-secondary px-3 py-1.5 text-xs font-medium mt-3 flex items-center gap-1.5">
+                        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+                        </svg>
+                        Refresh
+                    </button>
+                </div>
+                
+                <div class="section">
+                    <div class="table-container rounded border border-border bg-card overflow-hidden">
+                        <table class="w-full text-left border-collapse">
+                            <thead>
+                                <tr class="bg-muted text-muted-foreground text-xs border-b border-border">
+                                    <th class="px-4 py-3 font-medium cursor-pointer hover:bg-muted/50 transition-colors" data-sort-by="apiKey" data-sort-direction="asc">API Key <span class="sort-arrow" data-sort-indicator="apiKey"></span></th>
+                                    <th class="px-4 py-3 font-medium cursor-pointer hover:bg-muted/50 transition-colors" data-sort-by="comment" data-sort-direction="asc">Comment <span class="sort-arrow" data-sort-indicator="comment"></span></th>
+                                    <th class="px-4 py-3 font-medium cursor-pointer hover:bg-muted/50 transition-colors" data-sort-by="model" data-sort-direction="asc">Model <span class="sort-arrow" data-sort-indicator="model"></span></th>
+                                    <th class="px-4 py-3 font-medium cursor-pointer hover:bg-muted/50 transition-colors" data-sort-by="requests" data-sort-direction="asc">Requests by Status <span class="sort-arrow" data-sort-indicator="requests"></span></th>
+                                    <th class="px-4 py-3 font-medium cursor-pointer hover:bg-muted/50 transition-colors" data-sort-by="tokens" data-sort-direction="asc">Tokens (In / Out / Total) <span class="sort-arrow" data-sort-indicator="tokens"></span></th>
+                                </tr>
+                            </thead>
+                            <tbody id="stats-tbody" class="divide-y divide-border">
+                                <tr><td colspan="5" class="px-4 py-6 text-center text-muted-foreground text-sm">Loading statistics...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+</main>
 
         <!-- Footer -->
         <footer class="mt-12 py-6 border-t border-border">
@@ -732,6 +775,7 @@
 
     <script>
         let envVars = {};
+        let comments = {};
 
         // Unified copy to clipboard function that works without SSL
         async function copyToClipboard(text, successMessage) {
@@ -1141,6 +1185,8 @@
         async function loadEnvVars() {
             try {
                 const response = await fetch('/admin/api/env');
+                const commentsResponse = await fetch('/admin/api/comments');
+                comments = await commentsResponse.json();
                 envVars = await response.json();
                 renderEnvVars();
                 // Update provider preview when env vars are loaded
@@ -1528,10 +1574,13 @@
                         <div>
                             <label class="block text-muted-foreground mb-1 text-xs">API Keys</label>
                             <div class="space-y-1">
-                                ${provider.keys.map((key, keyIndex) => `
+                                ${provider.keys.map((key, keyIndex) => {
+                                    const comment = comments[key] || '';
+                                    return `
                                     <div class="flex items-center space-x-2">
-                                        <div class="flex-1 font-mono text-xs text-foreground bg-muted px-2 py-1 rounded">
-                                            ${key.length > 16 ? key.substring(0, 8) + '...' + key.slice(-4) : key}
+                                        <div class="flex-1">
+                                            <div class="font-mono text-xs text-foreground bg-muted px-2 py-1 rounded">${key.length > 16 ? key.substring(0, 8) + '...' + key.slice(-4) : key}</div>
+                                            <input type="text" value="${comment}" onchange="updateComment('${key}', this.value)" class="input-field w-full px-2 py-1 text-xs rounded transition-colors mt-1" placeholder="Add a comment...">
                                         </div>
                                         <button 
                                             onclick="testProviderKey('${provider.apiType}', '${provider.name}', '${key}', ${keyIndex})" 
@@ -1547,14 +1596,22 @@
                                             Delete
                                         </button>
                                     </div>
-                                `).join('')}
+                                `}).join('')}
                                 <div class="flex items-center space-x-2 mt-2 pt-2 border-t border-border">
+                                    <div class="flex-1 grid gap-1">
                                     <input 
                                         type="text" 
                                         id="newKey_${provider.apiType}_${provider.name}" 
-                                        class="input-field flex-1 px-2 py-1 text-xs rounded transition-colors" 
+                                        class="input-field px-2 py-1 text-xs rounded transition-colors" 
                                         placeholder="Enter new API key"
                                     >
+                                    <input 
+                                        type="text" 
+                                        id="newKeyComment_${provider.apiType}_${provider.name}" 
+                                        class="input-field px-2 py-1 text-xs rounded transition-colors" 
+                                        placeholder="Comment (optional)"
+                                    >
+                                    </div>
                                     <button 
                                         onclick="testProviderNewKey('${provider.apiType}', '${provider.name}')" 
                                         class="btn btn-secondary px-2 py-1 text-xs font-medium"
@@ -1801,6 +1858,11 @@
             }
             
             try {
+                await fetch('/admin/api/comments', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(comments)
+                });
                 const response = await fetch('/admin/api/env', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -2821,9 +2883,26 @@ ${googApiKeyHeader}  -H "Content-Type: application/json" \\
             }
         }
         
+        
+        async function updateComment(apiKey, comment) {
+            comments[apiKey] = comment;
+            try {
+                await fetch('/admin/api/comments', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ [apiKey]: comment })
+                });
+                showSuccessToast('Comment saved!');
+            } catch (error) {
+                showErrorToast('Failed to save comment: ' + error.message);
+            }
+        }
+        
         async function saveProviderKey(apiType, providerName) {
             const inputId = `newKey_${apiType}_${providerName}`;
             const newKey = document.getElementById(inputId).value.trim();
+            const commentInputId = `newKeyComment_${apiType}_${providerName}`;
+            const newKeyComment = document.getElementById(commentInputId).value.trim();
             
             if (!newKey) {
                 showWarningToast('Please enter an API key');
@@ -2868,6 +2947,9 @@ ${googApiKeyHeader}  -H "Content-Type: application/json" \\
             const existingKeys = envVars[keysVar] ? envVars[keysVar].split(',') : [];
             existingKeys.push(newKey);
             envVars[keysVar] = existingKeys.filter(k => k.trim()).join(',');
+            if (newKeyComment) {
+                comments[newKey] = newKeyComment;
+            }
             
             try {
                 const response = await fetch('/admin/api/env', {
@@ -3252,6 +3334,159 @@ ${googApiKeyHeader}  -H "Content-Type: application/json" \\
         function closeResponseDialog() {
             document.getElementById('responseDialog').classList.add('hidden');
         }
+
+        let currentSortColumn = 'apiKey'; // Default sort column
+        let currentSortDirection = 'asc'; // Default sort direction
+        let statsData = []; // To store the raw stats data
+
+        function getCellValue(item, column) {
+            switch (column) {
+                case 'apiKey': return item.apiKey;
+                case 'comment': return item.comment;
+                case 'model': return item.model;
+                case 'requests': return Object.values(item.value.requests || {}).reduce((sum, count) => sum + count, 0); // Sum of all request counts
+                case 'tokens': return item.value.tokens ? item.value.tokens.total : 0; // Total tokens
+                default: return '';
+            }
+        }
+
+        function sortStats(column) {
+            if (currentSortColumn === column) {
+                currentSortDirection = currentSortDirection === 'asc' ? 'desc' : 'asc';
+            } else {
+                currentSortColumn = column;
+                currentSortDirection = 'asc';
+            }
+
+            statsData.sort((a, b) => {
+                const aValue = getCellValue(a, currentSortColumn);
+                const bValue = getCellValue(b, currentSortColumn);
+
+                if (typeof aValue === 'string') {
+                    return currentSortDirection === 'asc' ? aValue.localeCompare(bValue) : bValue.localeCompare(aValue);
+                } else {
+                    return currentSortDirection === 'asc' ? aValue - bValue : bValue - aValue;
+                }
+            });
+
+            renderStatsTable(statsData); // Re-render the table with sorted data
+            updateSortIndicators();
+        }
+
+        function updateSortIndicators() {
+            document.querySelectorAll('.sort-arrow').forEach(span => {
+                span.textContent = ''; // Clear all arrows
+            });
+
+            const activeArrow = document.querySelector(`[data-sort-indicator="${currentSortColumn}"]`);
+            if (activeArrow) {
+                activeArrow.textContent = currentSortDirection === 'asc' ? ' ▲' : ' ▼';
+            }
+        }
+
+        function renderStatsTable(data) {
+            const tableBody = document.getElementById('stats-tbody');
+            if (!tableBody) return;
+
+            tableBody.innerHTML = '';
+
+            if (data.length === 0) {
+                tableBody.innerHTML = '<tr><td colspan="5" class="px-4 py-8 text-center text-muted-foreground text-sm">No statistics available yet. Make some API requests first!</td></tr>';
+                return;
+            }
+
+            // Helper for status badges (moved here to be in scope)
+            const getStatusBadge = (status, count) => {
+                let badgeClass = 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-300';
+                if (status.startsWith('2')) badgeClass = 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300';
+                else if (status.startsWith('4')) badgeClass = 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-300';
+                else if (status.startsWith('5') || status === 'error') badgeClass = 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300';
+                
+                return `<span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${badgeClass} mr-1 mb-1">${status}: ${count}</span>`;
+            };
+
+            data.forEach(item => {
+                const { key, value, comments: statsComments } = item; // Destructure item to get key, value, and comments
+                const colonIndex = key.indexOf(':');
+                const apiKey = colonIndex >= 0 ? key.substring(0, colonIndex) : key;
+                const model = colonIndex >= 0 ? key.substring(colonIndex + 1) : 'Unknown';
+                
+                const comment = statsComments[apiKey] || '<span class="text-muted-foreground italic">No comment</span>';
+                
+                let requestsHtml = '';
+                if (value.requests && Object.keys(value.requests).length > 0) {
+                    requestsHtml = Object.entries(value.requests)
+                        .sort((a, b) => a[0].localeCompare(b[0]))
+                        .map(([status, count]) => getStatusBadge(status, count))
+                        .join('');
+                } else {
+                    requestsHtml = '<span class="text-muted-foreground text-xs">0</span>';
+                }
+                
+                const t = value.tokens || { in: 0, out: 0, total: 0 };
+                const tokens = `<div class="font-mono text-xs">
+                    <span class="text-blue-500" title="Input Tokens">${t.in.toLocaleString()}</span> / 
+                    <span class="text-green-500" title="Output Tokens">${t.out.toLocaleString()}</span> / 
+                    <span class="font-bold text-foreground" title="Total Tokens">${t.total.toLocaleString()}</span>
+                </div>`;
+
+                const maskedKey = apiKey.length > 8 
+                    ? `${apiKey.substring(0, 4)}...${apiKey.slice(-4)}` 
+                    : (apiKey || 'Unknown');
+
+                const row = `<tr class="hover:bg-muted/30 transition-colors">
+                    <td class="px-4 py-3 font-mono text-xs text-foreground">${maskedKey}</td>
+                    <td class="px-4 py-3 text-xs text-foreground">${comment}</td>
+                    <td class="px-4 py-3">
+                        <span class="font-mono text-xs px-2 py-0.5 rounded bg-primary/10 text-primary border border-primary/20">${model}</span>
+                    </td>
+                    <td class="px-4 py-3"><div class="flex flex-wrap">${requestsHtml}</div></td>
+                    <td class="px-4 py-3">${tokens}</td>
+                </tr>`;
+                tableBody.innerHTML += row;
+            });
+        }
+
+        async function fetchStats() {
+            try {
+                const response = await fetch('/admin/api/stats');
+                
+                if (response.status === 401) {
+                    logout();
+                    return;
+                }
+                
+                const { stats, comments: statsComments } = await response.json();
+
+                // Transform stats into an array for easier sorting and store globally
+                statsData = Object.entries(stats).map(([key, value]) => ({
+                    key,
+                    value,
+                    apiKey: key.includes(':') ? key.substring(0, key.indexOf(':')) : key,
+                    model: key.includes(':') ? key.substring(key.indexOf(':') + 1) : 'Unknown',
+                    comment: statsComments[key.includes(':') ? key.substring(0, key.indexOf(':')) : key] || '',
+                    comments: statsComments // Pass comments for rendering
+                }));
+
+                // Initial sort (default or last used)
+                sortStats(currentSortColumn);
+
+                // Add event listeners to table headers for sorting after they are rendered
+                document.querySelectorAll('#stats-table th[data-sort-by]').forEach(header => {
+                    header.addEventListener('click', () => {
+                        const column = header.getAttribute('data-sort-by');
+                        sortStats(column);
+                    });
+                });
+
+            } catch (error) {
+                console.error('Failed to fetch stats:', error);
+                const tableBody = document.getElementById('stats-tbody');
+                if (tableBody) {
+                    tableBody.innerHTML = `<tr><td colspan="5" class="px-4 py-6 text-center text-destructive text-sm">Failed to load statistics: ${error.message}</td></tr>`;
+                }
+            }
+        }
         
         // Load logs when logs tab is shown
         function showTab(tabName) {
@@ -3268,16 +3503,23 @@ ${googApiKeyHeader}  -H "Content-Type: application/json" \\
             });
             
             // Show selected tab
-            document.getElementById(tabName).classList.remove('hidden');
+            const tabElement = document.getElementById(tabName);
+            if (tabElement) {
+                tabElement.classList.remove('hidden');
+            }
             
             // Set active state on clicked tab button
             const activeBtn = document.querySelector(`[data-tab="${tabName}"]`);
-            activeBtn.classList.add('active', 'text-foreground', 'border-primary');
-            activeBtn.classList.remove('text-muted-foreground');
+            if (activeBtn) {
+                activeBtn.classList.add('active', 'text-foreground', 'border-primary');
+                activeBtn.classList.remove('text-muted-foreground');
+            }
             
-            // Load logs if logs tab is selected
+            // Load data based on tab
             if (tabName === 'logs') {
                 refreshLogs();
+            } else if (tabName === 'stats') {
+                fetchStats();
             }
         }
         

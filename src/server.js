@@ -25,6 +25,51 @@ class ProxyServer {
     this.KeyRotator = require('./keyRotator');
     this.GeminiClient = require('./geminiClient');
     this.OpenAIClient = require('./openaiClient');
+
+    // API request queue (limit to one at a time)
+    this.apiQueue = [];
+    this.isProcessingApiRequest = false;
+    this.lastRequestFinishedTime = 0;
+  }
+
+  async runInQueue(requestId, fn) {
+    return new Promise((resolve, reject) => {
+      if (this.apiQueue.length > 0 || this.isProcessingApiRequest) {
+        logger.info(`[REQ-${requestId}] Adding to queue (Position: ${this.apiQueue.length + 1})`);
+      }
+      this.apiQueue.push({ requestId, fn, resolve, reject });
+      this.processQueue();
+    });
+  }
+
+  async processQueue() {
+    if (this.isProcessingApiRequest || this.apiQueue.length === 0) {
+      return;
+    }
+
+    const now = Date.now();
+    const timeSinceLastRequest = now - this.lastRequestFinishedTime;
+    const delayNeeded = 1000 - timeSinceLastRequest; // 1 second delay
+
+    if (delayNeeded > 0) {
+      // logger.info(`Delaying next request for ${delayNeeded}ms`);
+      await new Promise(resolve => setTimeout(resolve, delayNeeded));
+    }
+
+    this.isProcessingApiRequest = true;
+    const { requestId, fn, resolve, reject } = this.apiQueue.shift();
+
+    try {
+      const result = await fn();
+      resolve(result);
+    } catch (error) {
+      reject(error);
+    } finally {
+      this.isProcessingApiRequest = false;
+      this.lastRequestFinishedTime = Date.now();
+      // Use nextTick to avoid deep recursion if many small requests are queued
+      process.nextTick(() => this.processQueue());
+    }
   }
 
   start() {
@@ -154,7 +199,21 @@ class ProxyServer {
       }
 
       const { providerName, apiType, path, provider, legacy } = routeInfo;
-      logger.info(`[REQ-${requestId}] Proxying to provider '${providerName}' (${apiType.toUpperCase()}): ${path}`);
+      
+      // Get or create client for this provider to get the full target URL
+      const client = await this.getProviderClient(providerName, provider, legacy);
+      if (!client) {
+        logger.info(`[REQ-${requestId}] Response: 503 Service Unavailable - Provider '${providerName}' not configured`);
+        if (isApiCall) {
+          const responseTime = Date.now() - startTime;
+          this.logApiRequest(requestId, req.method, targetUrl, providerName, 503, responseTime, `Provider '${providerName}' not configured`, clientIp);
+        }
+        this.sendError(res, 503, `Provider '${providerName}' not configured`);
+        return;
+      }
+      
+      const targetUrl = client.getTargetUrl(req.method, path);
+      logger.info(`[REQ-${requestId}] Proxying to provider '${providerName}' (${apiType.toUpperCase()}): ${targetUrl}`);
 
       // Get the appropriate header based on API type
       const authHeader = apiType === 'gemini'
@@ -170,7 +229,7 @@ class ProxyServer {
 
         if (isApiCall) {
           const responseTime = Date.now() - startTime;
-          this.logApiRequest(requestId, req.method, path, providerName, 401, responseTime, 'Invalid or missing ACCESS_KEY', clientIp);
+          this.logApiRequest(requestId, req.method, targetUrl, providerName, 401, responseTime, 'Invalid or missing ACCESS_KEY', clientIp);
         }
 
         this.sendError(res, 401, `Invalid or missing ACCESS_KEY for provider '${providerName}'`);
@@ -179,7 +238,7 @@ class ProxyServer {
       
       // Log the initial request
       if (isApiCall) {
-        this.logApiRequest(requestId, req.method, path, providerName, null, null, null, clientIp);
+        this.logApiRequest(requestId, req.method, targetUrl, providerName, null, null, null, clientIp);
       }
 
       // Clean the auth header before passing to API
@@ -198,29 +257,18 @@ class ProxyServer {
 
       let response;
 
-      // Get or create client for this provider
-      const client = await this.getProviderClient(providerName, provider, legacy);
-      if (!client) {
-        logger.info(`[REQ-${requestId}] Response: 503 Service Unavailable - Provider '${providerName}' not configured`);
-
-        if (isApiCall) {
-          const responseTime = Date.now() - startTime;
-          this.logApiRequest(requestId, req.method, path, providerName, 503, responseTime, `Provider '${providerName}' not configured`, clientIp);
-        }
-
-        this.sendError(res, 503, `Provider '${providerName}' not configured`);
-        return;
-      }
-
       // Pass custom status codes to client if provided
       if (customStatusCodes) {
         logger.info(`[REQ-${requestId}] Using custom status codes for rotation: ${Array.from(customStatusCodes).join(', ')}`);
       }
 
-      response = await client.makeRequest(req.method, path, body, headers, customStatusCodes);
-      
+      response = await this.runInQueue(requestId, async () => {
+        return await client.makeRequest(req.method, path, body, headers, customStatusCodes);
+      });
+
       // Log the successful response
       if (isApiCall) {
+
         const responseTime = Date.now() - startTime;
         const error = response.statusCode >= 400 ? `HTTP ${response.statusCode}` : null;
         this.logApiRequest(requestId, req.method, path, providerName, response.statusCode, responseTime, error, clientIp);
@@ -269,7 +317,16 @@ class ProxyServer {
 
       if (provider) {
         // Extract the API path after /{provider}
-        const apiPath = '/' + pathParts.slice(1).join('/') + urlObj.search;
+        let apiPath = '/' + pathParts.slice(1).join('/') + urlObj.search;
+
+        // Special handling for vertex: strip /v1beta/ or /v1base/ if present at the beginning
+        if (providerName === 'vertex') {
+          if (apiPath.startsWith('/v1beta/')) {
+            apiPath = apiPath.substring(7); // Remove '/v1beta'
+          } else if (apiPath.startsWith('/v1base/')) {
+            apiPath = apiPath.substring(7); // Remove '/v1base'
+          }
+        }
 
         return {
           providerName: providerName,
@@ -579,6 +636,11 @@ class ProxyServer {
       return;
     }
     
+    if (path === '/admin/stats' || path === '/admin/stats/') {
+      this.serveStatsPanel(res);
+      return;
+    }
+    
     // Check authentication status
     if (path === '/admin/api/auth' && req.method === 'GET') {
       const isAuthenticated = this.isAdminAuthenticated(req);
@@ -630,6 +692,12 @@ class ProxyServer {
       await this.handleGetEnvVars(res);
     } else if (path === '/admin/api/env-file' && req.method === 'GET') {
       await this.handleGetEnvFile(res);
+    } else if (path === '/admin/api/stats' && req.method === 'GET') {
+      this.handleGetStats(res);
+    } else if (path === '/admin/api/comments' && req.method === 'GET') {
+      this.handleGetComments(res);
+    } else if (path === '/admin/api/comments' && req.method === 'POST') {
+      this.handleUpdateComments(res, body);
     } else if (path === '/admin/api/env' && req.method === 'POST') {
       await this.handleUpdateEnvVars(res, body);
     } else if (path === '/admin/api/test' && req.method === 'POST') {
@@ -765,6 +833,52 @@ class ProxyServer {
   }
   
   
+  async handleGetStats(res) {
+    try {
+      const KeyRotator = require('./keyRotator');
+      const stats = KeyRotator.getAllStats ? KeyRotator.getAllStats() : {};
+      const comments = KeyRotator.getAllComments ? KeyRotator.getAllComments() : {};
+      
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ stats, comments }));
+    } catch (error) {
+      this.sendError(res, 500, 'Failed to get stats');
+    }
+  }
+
+  async handleGetComments(res) {
+    try {
+      const comments = {};
+      const { globalKeyComments } = require('./keyRotator');
+      // Wait, globalKeyComments is not exported. Let's export a static method on KeyRotator to get all.
+      // We will add getAllComments to KeyRotator.
+      const KeyRotator = require('./keyRotator');
+      if (KeyRotator.getAllComments) {
+        Object.assign(comments, KeyRotator.getAllComments());
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(comments));
+    } catch (error) {
+      this.sendError(res, 500, 'Failed to read comments');
+    }
+  }
+
+  async handleUpdateComments(res, body) {
+    try {
+      const comments = JSON.parse(body);
+      const KeyRotator = require('./keyRotator');
+      if (KeyRotator.setKeyComment) {
+        for (const [key, comment] of Object.entries(comments)) {
+          KeyRotator.setKeyComment(key, comment);
+        }
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true }));
+    } catch (error) {
+      this.sendError(res, 500, 'Failed to update comments');
+    }
+  }
+
   async handleUpdateEnvVars(res, body) {
     try {
       const envVars = JSON.parse(body);
@@ -950,6 +1064,9 @@ class ProxyServer {
   async handleTestApiKey(res, body) {
     try {
       const { apiType, apiKey, baseUrl } = JSON.parse(body);
+      const maskedKey = apiKey ? `${apiKey.substring(0, 4)}...${apiKey.substring(apiKey.length - 4)}` : 'null';
+      logger.info(`[ADMIN] Testing ${apiType} API key: ${maskedKey} | Base URL: ${baseUrl || 'default'}`);
+      
       let testResult = { success: false, error: 'Unknown API type' };
       
       if (apiType === 'gemini') {
@@ -976,14 +1093,17 @@ class ProxyServer {
     let testPath = '/models';
     let fullUrl;
     
-    if (testBaseUrl.includes('/v1') || testBaseUrl.includes('/v1beta')) {
-      // Base URL already includes version, just append models
+    // if (testBaseUrl.includes('/v1') || testBaseUrl.includes('/v1beta')) {
+    //   // Base URL already includes version, just append models
       fullUrl = `${testBaseUrl.endsWith('/') ? testBaseUrl.slice(0, -1) : testBaseUrl}/models?key=${apiKey}`;
-    } else {
-      // Base URL doesn't include version, add /v1/models
-      fullUrl = `${testBaseUrl.endsWith('/') ? testBaseUrl.slice(0, -1) : testBaseUrl}/v1/models?key=${apiKey}`;
-      testPath = '/v1/models';
-    }
+    // } else {
+    //   // Base URL doesn't include version, add /v1/models
+    //   fullUrl = `${testBaseUrl.endsWith('/') ? testBaseUrl.slice(0, -1) : testBaseUrl}/v1/models?key=${apiKey}`;
+    //   testPath = '/v1/models';
+    // }
+    
+    const maskedUrl = fullUrl.replace(/key=[^&]+/, 'key=REDACTED');
+    logger.info(`[TEST-${testId}] GET ${maskedUrl} (Gemini) - Initiating request...`);
     
     try {
       const testResponse = await fetch(fullUrl);
@@ -1007,7 +1127,8 @@ class ProxyServer {
       const error = !testResponse.ok ? `API test failed: ${testResponse.status} ${testResponse.statusText}` : null;
       this.logApiRequest(testId, 'GET', testPath, 'gemini', testResponse.status, responseTime, error, 'admin-test');
       
-      logger.info(`[TEST-${testId}] GET ${testPath} (Gemini) → ${testResponse.status} ${testResponse.statusText} | ${contentType} ${responseText.length}b`);
+      const maskedUrl = fullUrl.replace(/key=[^&]+/, 'key=REDACTED');
+      logger.info(`[TEST-${testId}] GET ${maskedUrl} (Gemini) → ${testResponse.status} ${testResponse.statusText} | ${contentType} ${responseText.length}b`);
       
       return { 
         success: testResponse.ok, 
@@ -1016,7 +1137,8 @@ class ProxyServer {
     } catch (error) {
       const responseTime = Date.now() - startTime;
       
-      logger.info(`[TEST-${testId}] GET ${testPath} (Gemini) → ERROR: ${error.message}`);
+      const maskedUrl = fullUrl ? fullUrl.replace(/key=[^&]+/, 'key=REDACTED') : 'Unknown URL';
+      logger.info(`[TEST-${testId}] GET ${maskedUrl} (Gemini) → ERROR: ${error.message}`);
       this.logApiRequest(testId, 'GET', testPath, 'gemini', null, responseTime, error.message, 'admin-test');
       
       return { success: false, error: error.message };
@@ -1038,6 +1160,8 @@ class ProxyServer {
     } else if (testBaseUrl.includes('/v1')) {
       testPath = '/v1/models';
     }
+    
+    logger.info(`[TEST-${testId}] GET ${fullUrl} (OpenAI) | Auth: Bearer REDACTED - Initiating request...`);
     
     try {
       const testResponse = await fetch(fullUrl, {
@@ -1064,7 +1188,7 @@ class ProxyServer {
       const error = !testResponse.ok ? `API test failed: ${testResponse.status} ${testResponse.statusText}` : null;
       this.logApiRequest(testId, 'GET', testPath, 'openai', testResponse.status, responseTime, error, 'admin-test');
       
-      logger.info(`[TEST-${testId}] GET ${testPath} (OpenAI) → ${testResponse.status} ${testResponse.statusText} | ${contentType} ${responseText.length}b`);
+      logger.info(`[TEST-${testId}] GET ${fullUrl} (OpenAI) | Auth: Bearer REDACTED → ${testResponse.status} ${testResponse.statusText} | ${contentType} ${responseText.length}b`);
       
       return { 
         success: testResponse.ok, 
@@ -1073,7 +1197,7 @@ class ProxyServer {
     } catch (error) {
       const responseTime = Date.now() - startTime;
       
-      logger.info(`[TEST-${testId}] GET ${testPath} (OpenAI) → ERROR: ${error.message}`);
+      logger.info(`[TEST-${testId}] GET ${fullUrl} (OpenAI) → ERROR: ${error.message}`);
       this.logApiRequest(testId, 'GET', testPath, 'openai', null, responseTime, error.message, 'admin-test');
       
       return { success: false, error: error.message };
@@ -1222,6 +1346,17 @@ class ProxyServer {
       res.end(html);
     } catch (error) {
       this.sendError(res, 500, 'Admin panel not found');
+    }
+  }
+
+  serveStatsPanel(res) {
+    try {
+      const htmlPath = path.join(process.cwd(), 'public', 'stats.html');
+      const html = fs.readFileSync(htmlPath, 'utf8');
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end(html);
+    } catch (error) {
+      this.sendError(res, 500, 'Stats panel not found');
     }
   }
 

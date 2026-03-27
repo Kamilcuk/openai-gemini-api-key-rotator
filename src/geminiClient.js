@@ -1,6 +1,7 @@
 const https = require('https');
 const { URL } = require('url');
 const logger = require('./logger');
+const { resolveModelChain } = require('./modelAliases');
 
 class GeminiClient {
   constructor(keyRotator, baseUrl = 'https://generativelanguage.googleapis.com', proxyAgent = null) {
@@ -15,13 +16,9 @@ class GeminiClient {
     const modelMatch = path.match(/\/models\/([^:]+):/);
     if (modelMatch) requestedModel = modelMatch[1];
 
-    let modelsToTry = [requestedModel];
-    if (requestedModel === 'mypro') {
-      modelsToTry = [ 'gemini-3.1-pro-preview', 'gemini-3-pro-preview', 'gemini-2.5-pro'];
-      logger.info(`[GEMINI] "mypro" requested. Fallback chain: ${modelsToTry.join(' -> ')}`);
-    } else if (requestedModel === 'my') {
-      modelsToTry = [ 'gemini-3.1-pro-preview', 'gemini-3-pro-preview', 'gemini-2.5-pro', 'gemini-3-flash-preview', 'gemini-2.5-flash'];
-      logger.info(`[GEMINI] "my" requested. Fallback chain: ${modelsToTry.join(' -> ')}`);
+    let modelsToTry = resolveModelChain(requestedModel);
+    if (modelsToTry.length > 1) {
+      logger.info(`[GEMINI] Alias "${requestedModel}" requested. Fallback chain: ${modelsToTry.join(' -> ')}`);
     }
 
     const rotationStatusCodes = customStatusCodes || new Set([429, 403]);
@@ -260,6 +257,30 @@ class GeminiClient {
   maskApiKey(key) {
     if (!key || key.length < 4) return '**';
     return '**' + key.substring(key.length - 4);
+  }
+
+  getTargetUrl(method, path) {
+    let fullUrl;
+    if (!path || path === '/') {
+      fullUrl = this.baseUrl;
+    } else if (path.startsWith('/')) {
+      let effectiveBaseUrl = this.baseUrl;
+      const pathVersionMatch = path.match(/^\/v[^\/]+\//);
+      const baseVersionMatch = this.baseUrl.match(/\/v[^\/]+$/);
+
+      if (pathVersionMatch && baseVersionMatch) {
+        const pathVersion = pathVersionMatch[0].slice(0, -1);
+        const baseVersion = baseVersionMatch[0];
+        if (pathVersion !== baseVersion) {
+          effectiveBaseUrl = this.baseUrl.replace(baseVersion, pathVersion);
+          path = path.substring(pathVersion.length);
+        }
+      }
+      fullUrl = effectiveBaseUrl.endsWith('/') ? effectiveBaseUrl + path.substring(1) : effectiveBaseUrl + path;
+    } else {
+      fullUrl = this.baseUrl.endsWith('/') ? this.baseUrl + path : this.baseUrl + '/' + path;
+    }
+    return fullUrl;
   }
 }
 

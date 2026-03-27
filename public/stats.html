@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>API Key Rotator - Stats</title>
+    <!-- We can use the Tailwind CDN for quick styling or the local one -->
+    <script src="/tailwind-3.4.17.js"></script>
+    <style>
+        body { font-family: system-ui, -apple-system, sans-serif; }
+        .table-container { 
+            max-height: calc(100vh - 12rem); 
+            overflow-y: auto; 
+            border-radius: 0.5rem;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+        }
+        table { border-collapse: collapse; width: 100%; text-align: left; }
+        th, td { 
+            padding: 0.75rem 1rem; 
+            border-bottom: 1px solid #e5e7eb;
+        }
+        th { 
+            background-color: #f9fafb; 
+            font-weight: 600; 
+            color: #374151;
+            position: sticky;
+            top: 0;
+            z-index: 10;
+        }
+        tr:hover { background-color: #f3f4f6; }
+        .badge {
+            display: inline-block;
+            padding: 0.25em 0.4em;
+            font-size: 75%;
+            font-weight: 700;
+            line-height: 1;
+            text-align: center;
+            white-space: nowrap;
+            vertical-align: baseline;
+            border-radius: 0.25rem;
+            margin-right: 0.25rem;
+            margin-bottom: 0.25rem;
+        }
+        .badge-success { background-color: #d1fae5; color: #065f46; }
+        .badge-error { background-color: #fee2e2; color: #991b1b; }
+        .badge-warning { background-color: #fef3c7; color: #92400e; }
+        .badge-info { background-color: #e0e7ff; color: #3730a3; }
+    </style>
+</head>
+<body class="bg-gray-100 min-h-screen text-gray-800 p-6">
+    <div class="max-w-7xl mx-auto">
+        <div class="flex justify-between items-center mb-6">
+            <h1 class="text-3xl font-bold text-gray-900">API Key Statistics</h1>
+            <a href="/admin" class="bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-2 px-4 rounded transition-colors duration-150">
+                &larr; Back to Admin
+            </a>
+        </div>
+        
+        <div class="table-container bg-white">
+            <table id="stats-table" class="w-full">
+                <thead>
+                    <tr>
+                        <th class="w-1/6">API Key</th>
+                        <th class="w-1/4">Comment</th>
+                        <th class="w-1/6">Model</th>
+                        <th class="w-1/5">Requests by Status</th>
+                        <th class="w-1/5">Tokens (In / Out / Total)</th>
+                    </tr>
+                </thead>
+                <tbody id="stats-tbody">
+                    <tr><td colspan="5" class="text-center py-4 text-gray-500">Loading statistics...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <script>
+        // Simple formatting for status badges
+        function getStatusBadge(status, count) {
+            let badgeClass = 'badge-info';
+            if (status.startsWith('2')) badgeClass = 'badge-success';
+            else if (status.startsWith('4')) badgeClass = 'badge-warning';
+            else if (status.startsWith('5') || status === 'error') badgeClass = 'badge-error';
+            
+            return `<span class="badge ${badgeClass}">${status}: ${count}</span>`;
+        }
+
+        async function fetchStats() {
+            try {
+                const response = await fetch('/admin/api/stats');
+                
+                if (response.status === 401) {
+                    window.location.href = '/admin'; // Redirect to login if not authenticated
+                    return;
+                }
+                
+                const { stats, comments } = await response.json();
+                const tableBody = document.getElementById('stats-tbody');
+                
+                if (Object.keys(stats).length === 0) {
+                    tableBody.innerHTML = '<tr><td colspan="5" class="text-center py-8 text-gray-500">No statistics available yet. Make some API requests first!</td></tr>';
+                    return;
+                }
+                
+                tableBody.innerHTML = '';
+
+                for (const [key, value] of Object.entries(stats)) {
+                    // Extract API key and model properly
+                    const colonIndex = key.indexOf(':');
+                    const apiKey = colonIndex >= 0 ? key.substring(0, colonIndex) : key;
+                    const model = colonIndex >= 0 ? key.substring(colonIndex + 1) : 'Unknown';
+                    
+                    const comment = comments[apiKey] || '<span class="text-gray-400 italic">No comment</span>';
+                    
+                    let requestsHtml = '';
+                    if (value.requests && Object.keys(value.requests).length > 0) {
+                        requestsHtml = Object.entries(value.requests)
+                            .sort((a, b) => a[0].localeCompare(b[0])) // Sort by status code
+                            .map(([status, count]) => getStatusBadge(status, count))
+                            .join(' ');
+                    } else {
+                        requestsHtml = '<span class="text-gray-400">0</span>';
+                    }
+                    
+                    const t = value.tokens || { in: 0, out: 0, total: 0 };
+                    const tokens = `<div class="font-mono text-sm">
+                        <span class="text-blue-600" title="Input Tokens">${t.in.toLocaleString()}</span> / 
+                        <span class="text-green-600" title="Output Tokens">${t.out.toLocaleString()}</span> / 
+                        <span class="font-bold text-gray-700" title="Total Tokens">${t.total.toLocaleString()}</span>
+                    </div>`;
+
+                    const maskedKey = apiKey.length > 8 
+                        ? `${apiKey.substring(0, 4)}...${apiKey.slice(-4)}` 
+                        : (apiKey || 'Unknown');
+
+                    const row = `<tr>
+                        <td class="font-mono text-sm">${maskedKey}</td>
+                        <td class="text-sm">${comment}</td>
+                        <td class="font-mono text-sm text-purple-700 bg-purple-50 px-2 py-1 rounded inline-block mt-2">${model}</td>
+                        <td><div class="flex flex-wrap gap-1">${requestsHtml}</div></td>
+                        <td>${tokens}</td>
+                    </tr>`;
+                    tableBody.innerHTML += row;
+                }
+            } catch (error) {
+                console.error('Failed to fetch stats:', error);
+                document.getElementById('stats-tbody').innerHTML = `
+                    <tr><td colspan="5" class="text-center py-4 text-red-500">
+                        Failed to load statistics: ${error.message}
+                    </td></tr>
+                `;
+            }
+        }
+        
+        // Load stats immediately and then refresh every 10 seconds
+        fetchStats();
+        setInterval(fetchStats, 10000);
+    </script>
+</body>
+</html>
